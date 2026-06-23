@@ -16,6 +16,7 @@ mod backend;
 mod lobe;
 mod present;
 mod present_scene;
+mod prompt;
 mod sprite;
 mod stats;
 mod trace;
@@ -396,19 +397,9 @@ fn main() -> Result<()> {
     if cli.interject_mode == InterjectMode::Context && !cli.frame {
         eprintln!("[lobe] context interject-mode requires framing; enabling --frame implicitly");
     }
-    // #5: with frame, put the persona in gemma-4's dedicated SYSTEM turn and open the model turn so
-    // the stream is scored as the model's reasoning; otherwise pin it as plain text. add_bos=true here
-    // only — BOS itself is the canonical first attention sink, reinforced by the system prompt.
-    // NB gemma-4 has a real `system` role (verified against the GGUF tokenizer.chat_template and the
-    // official prompt-formatting docs): `messages[0].role in ['system','developer']` emits a dedicated
-    // `<|turn>system ... <turn|>` block — it is NOT folded into the user turn (that's gemma-2/3). The
-    // interjection ASKS (Lobe::interject_ask_*) stay `user` turns — those really are the user asking.
-    let preamble_text = if frame {
-        // gemma-4 chat turn format: <|turn> opens, <turn|> closes (see Lobe::interject).
-        format!("<|turn>system\n{system_prompt}<turn|>\n<|turn>model\n")
-    } else {
-        system_prompt.to_string()
-    };
+    // #5: with frame the persona goes in gemma-4's dedicated SYSTEM turn (see prompt::system_preamble
+    // for the chat-format rationale); add_bos=true — BOS is the canonical first attention sink.
+    let preamble_text = prompt::system_preamble(&system_prompt, frame);
     let preamble_tokens = lobe.tokenize(&preamble_text, true)?;
     lobe.prime(&preamble_tokens)?;
 

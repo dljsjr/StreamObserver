@@ -1253,14 +1253,9 @@ impl<'a> Lobe<'a> {
     /// text instead of reacting. Keep the recent block first and the instruction after it.
     fn interject_prompt_snippet(&self) -> String {
         // Snippet mode can't fork the live KV, so it carries the recent window as text. (Modality
-        // lives in the system prompt; length in interject_max.)
+        // lives in the system prompt; length in interject_max.) Template: prompt::interject_prompt_snippet.
         let recent: String = self.recent.iter().map(String::as_str).collect();
-        let recent = word_aligned(&recent).trim();
-        format!(
-            "<|turn>user\nHere is the passage the text has just reached:\n\n{recent}\n\nGive your \
-             brief aside on it — what's happening, what it's doing, what it means.<turn|>\n\
-             <|turn>model\n",
-        )
+        crate::prompt::interject_prompt_snippet(word_aligned(&recent).trim())
     }
 
     /// CONTEXT mode ask: appended AFTER the forked full context (no BOS — it continues that
@@ -1280,7 +1275,7 @@ impl<'a> Lobe<'a> {
 
         // Novelty memory (H4). Off = omit it entirely; otherwise show the last 1–2 asides, with the
         // framing chosen by `novelty_mode` (Fresh = content novelty [control]; Form = form novelty).
-        let already = if self.novelty_mode == NoveltyMode::Off {
+        let novelty_block = if self.novelty_mode == NoveltyMode::Off {
             String::new()
         } else {
             let noted: String = self
@@ -1303,22 +1298,14 @@ impl<'a> Lobe<'a> {
             NoveltyMode::Form => " — but vary your rhythm and how you begin, not just the subject",
             NoveltyMode::Off => "",
         };
-
-        // Ask framing (H2). Passage = discrete "comment on this quoted span" (control). Continuous =
-        // pick up an ongoing thread (tests whether the per-aside reset drives the template).
-        match self.ask_mode {
-            AskMode::Passage => format!(
-                "<turn|>\n<|turn>user\nHere is the passage the text has just reached, quoted for you \
-                 to comment on (not continue):\n\n\u{201c}{span}\u{201d}{already}\n\nGive your aside \
-                 on it — what's happening here, what it's doing, what it means, and how it connects \
-                 to what came before{novelty_clause}.<turn|>\n<|turn>model\n",
-            ),
-            AskMode::Continuous => format!(
-                "<turn|>\n<|turn>user\nYou've been musing as you read, and the text has moved on \
-                 to:\n\n\u{201c}{span}\u{201d}{already}\n\nGo on — pick up your running commentary in \
-                 your own voice{novelty_clause}.<turn|>\n<|turn>model\n",
-            ),
-        }
+        // Ask framing (H2): Passage = "comment on this quoted span" (control); Continuous = pick up an
+        // ongoing thread. Template: prompt::interject_ask_context.
+        crate::prompt::interject_ask_context(
+            span,
+            &novelty_block,
+            novelty_clause,
+            self.ask_mode == AskMode::Continuous,
+        )
     }
 
     /// One-shot, blocking chat-framed *observation* about the surprising token (used by headless,
@@ -1504,15 +1491,7 @@ impl<'a> Lobe<'a> {
     pub fn rag(&mut self, surprising: &str, max: usize) -> Result<RagOutcome> {
         self.session.clear_seq(GEN_SEQ as u32)?;
         let recent: String = self.recent.iter().map(String::as_str).collect();
-        // gemma-4 native tool declaration (strings delimited by the <|"|> quote token).
-        const SEARCH_TOOL: &str = r#"<|tool>declaration:search{description:<|"|>Look up an unfamiliar term, name, place, or reference.<|"|>,parameters:{properties:{query:{description:<|"|>what to look up<|"|>,type:<|"|>STRING<|"|>},source:{description:<|"|>mem for this session's earlier context, rag for the external knowledge base<|"|>,type:<|"|>STRING<|"|>}},required:[<|"|>query<|"|>,<|"|>source<|"|>],type:<|"|>OBJECT<|"|>}}<tool|>"#;
-        let prompt = format!(
-            "<|turn>system\n{SEARCH_TOOL}\n<turn|>\n<|turn>user\nHere is the train of thought you've \
-             been following:\n\n{recent}\n\nThe token \"{surprising}\" stood out. If it is an \
-             unfamiliar term, name, place, or reference worth looking up, call the search tool. \
-             Otherwise just say in a sentence what you noticed.<turn|>\n<|turn>model\n",
-            recent = word_aligned(&recent).trim(),
-        );
+        let prompt = crate::prompt::rag_prompt(word_aligned(&recent).trim(), surprising);
         let t0 = std::time::Instant::now();
         let toks = self.tokenize(&prompt, true)?;
         let prompt_len = toks.len();
