@@ -264,6 +264,12 @@ pub struct Lobe<'a> {
     /// Rolling ring of recent STREAM token *ids* — distinct from `recent`'s strings, because
     /// detok→retok is not round-trip safe, so we replay the actual ids. Capped at `keep_recent`.
     recent_ids: VecDeque<Token>,
+    /// The COMPLETE stream-token content currently in seq 0 (everything decoded since the last reset
+    /// / prime — NOT capped, so it can grow to ~n_ctx between resets). The full live context is
+    /// `preamble + context_ids`; this is what the context-dumping diagnostics replay so they show
+    /// *all* the tokens the model is attending to, not just the recent window. Reset to `recent_ids`
+    /// on a roll (the post-reset seq-0 stream content).
+    context_ids: Vec<Token>,
     /// How many recent stream tokens to replay after a reset (the rolling window).
     keep_recent: usize,
     /// Post-reset trigger-suppression countdown.
@@ -369,6 +375,7 @@ impl<'a> Lobe<'a> {
             n_keep: 0,
             preamble: Vec::new(),
             recent_ids: VecDeque::new(),
+            context_ids: Vec::new(),
             keep_recent: 4096,
             settle: 0,
             refractory: 0,
@@ -514,9 +521,17 @@ impl<'a> Lobe<'a> {
         serde_json::to_string(logits).unwrap_or_default()
     }
 
-    /// The observer's current rolling context window (recent token texts), for context dumps.
-    fn recent_window_text(&self) -> String {
-        self.recent.iter().map(String::as_str).collect()
+    /// The COMPLETE live context the observer is attending to, as text — the verbatim framing
+    /// (preamble: BOS + the pinned `<|turn>system…<turn|>` sink + open model turn) followed by ALL
+    /// stream tokens currently in seq 0 (`context_ids`, uncapped). This is what every context-dumping
+    /// diagnostic emits, so a trace shows *all* the tokens in context, not a truncated recent window.
+    /// Specials render as text (`detok`) so the turn markers are visible.
+    fn full_context_text(&self) -> String {
+        self.preamble
+            .iter()
+            .chain(self.context_ids.iter())
+            .map(|&t| self.detok(t))
+            .collect()
     }
 
     /// Choose how interjections see context: forked-full-context (`Context`) or snippet (#7 nuance).
@@ -646,12 +661,14 @@ impl<'a> Lobe<'a> {
         self.resets
     }
 
-    /// Append a committed stream token id to the rolling reset window.
+    /// Append a committed stream token id to the rolling reset window AND to the full live-context
+    /// record (`context_ids`, uncapped — the complete seq-0 stream content for diagnostics).
     fn push_recent_id(&mut self, tok: Token) {
         self.recent_ids.push_back(tok);
         while self.recent_ids.len() > self.keep_recent {
             self.recent_ids.pop_front();
         }
+        self.context_ids.push(tok);
     }
 
     /// Append an observed token's text to the rolling recent-context window.
@@ -758,6 +775,7 @@ impl<'a> Lobe<'a> {
             self.keep_recent = room;
         }
         self.recent_ids = VecDeque::with_capacity(self.keep_recent);
+        self.context_ids.clear(); // the stream part of seq 0 starts empty (preamble is separate)
         self.prefill_seq0(tokens)
     }
 
@@ -775,15 +793,34 @@ impl<'a> Lobe<'a> {
         self.pos = 0;
         self.last_logits.clear();
         self.prefill_seq0(&replay)?;
+        // The rebuilt seq-0 stream content is exactly the replayed window, so the full-context record
+        // tracks it (then grows again as new tokens stream in).
+        self.context_ids = self.recent_ids.iter().copied().collect();
         self.settle = RESET_SETTLE;
         self.resets += 1;
-        // Window-slide observability: a reset cleared seq 0 and rebuilt sink + recent window.
+        // Window-slide observability: a reset cleared seq 0 and rebuilt sink + recent window. At INFO
+        // we also dump the reconstructed context split into the two parts, so a trace can SEE that the
+        // opening framing is preserved intact: `framing` = the verbatim-replayed preamble (the BOS +
+        // `<|turn>system…<turn|>` sink — CONSTANT across every reset), `window` = the rolling stream
+        // tokens (the ONLY part that slides). Gated by `enabled!` so it's free when no subscriber is on.
+        let dump = tracing::enabled!(target: "lobe::roll", tracing::Level::INFO);
+        let framing = if dump {
+            self.preamble.iter().map(|&t| self.detok(t)).collect::<String>()
+        } else {
+            String::new()
+        };
+        let window_text = if dump {
+            self.recent_ids.iter().map(|&t| self.detok(t)).collect::<String>()
+        } else {
+            String::new()
+        };
         tracing::info!(
             target: "lobe::roll", kind = "window_slide",
             reset_index = self.resets, stream_index = self.stream_index as u64,
             pos_before = pos_before as i64, pos_after = self.pos as i64, n_keep = self.n_keep as i64,
             recent_window = window as u64, replay_len = replay_len as u64, n_ctx = self.n_ctx as i64,
             latency_us = t0.elapsed().as_micros() as u64,
+            framing = %framing, window = %window_text,
             "window_slide"
         );
         Ok(())
@@ -909,7 +946,7 @@ impl<'a> Lobe<'a> {
                 baseline_std = stats.std() as f64, fired, suppressed_settle = suppressed,
                 in_refractory, gate_pass = gate, decode_us,
                 logits = logit_dump.as_deref().unwrap_or(""),
-                context = if obs_trace { self.recent_window_text() } else { String::new() },
+                context = if obs_trace { self.full_context_text() } else { String::new() },
                 "observe"
             );
         }
@@ -921,7 +958,7 @@ impl<'a> Lobe<'a> {
                 z = z as f64, baseline_mean = stats.mean() as f64, baseline_std = stats.std() as f64,
                 delta_span = %self.last_span, logits = logit_dump.as_deref().unwrap_or(""),
                 full_logits = full_logits.as_deref().unwrap_or(""),
-                context = %self.recent_window_text(),
+                context = %self.full_context_text(),
                 "trigger"
             );
         }
@@ -1332,6 +1369,10 @@ impl<'a> Lobe<'a> {
             trigger_token = %surprising, start_pos = start_pos as i64,
             prompt_tokens = toks.len() as u64, max = max as u64,
             delta_span = %word_aligned(&self.last_span).trim(),
+            // The delta span (above) and the ENTIRE live context (below), dumped separately: the span
+            // is what the ask spotlights; `full_context` is the whole forked seq-0 the model reflects
+            // over (framing + all stream tokens). Lazily evaluated — only when the trace is enabled.
+            full_context = %self.full_context_text(),
             novelty_memory = %self.recent_interjections.iter().rev().take(2)
                 .cloned().collect::<Vec<_>>().join(" ||| "),
             prompt = %prompt_text, // the raw model input, verbatim
