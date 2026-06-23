@@ -209,29 +209,13 @@ struct Cli {
     #[arg(long, default_value_t = 96)]
     interject_max: usize,
 
-    /// Seed for the interjection sampler's RNG. Fixed by default → byte-identical output every run.
-    /// Affects ONLY interjection *content* (sampling at --interject-temp > 0); the surprisal trigger
-    /// (greedy, off the forward pass) is deterministic regardless, so the SAME tokens fire either way.
-    /// Pass a different value for reproducible-but-different asides.
-    #[arg(long, default_value_t = 0x9E3779B97F4A7C15)]
-    seed: u64,
-
-    /// Draw the sampler seed from OS entropy → NON-deterministic interjections (a fresh sequence each
-    /// run, like a chat API). Overrides --seed. The seed used is printed to stderr so a run you like
-    /// can be reproduced with `--seed <that value>`. Also turns on stochastic firing by default (so
-    /// the TRIGGERS vary too, not just the asides) — see --fire-softness.
+    /// Make the observer NON-deterministic. By default every run is byte-identical: the sampler uses
+    /// a fixed seed, and the surprisal trigger is teacher-forced/greedy (deterministic by construction
+    /// — there's no sampler on the observation path to seed). With this flag the code picks a random
+    /// seed from OS entropy each run AND softens the firing decision (probabilistic sigmoid), so BOTH
+    /// the asides AND which tokens fire vary run-to-run — like a chat API. No argument; no tuning.
     #[arg(long, default_value_t = false)]
-    random_seed: bool,
-
-    /// Stochastic-firing softness (z-units): makes the trigger DECISION probabilistic instead of a
-    /// hard threshold — fire with P = sigmoid((z − z_threshold)/softness), drawn from the seeded RNG.
-    /// So which tokens fire varies under --random-seed and reproduces under --seed. The surprisal
-    /// value itself is still the exact deterministic read; only the fire/no-fire choice near the
-    /// threshold is softened. Default: 0 (hard threshold) normally, 0.5 when --random-seed is set.
-    /// Pass an explicit value to override either way (e.g. `--fire-softness 0` to keep hard firing
-    /// even under --random-seed, or `--fire-softness 0.8` without it for reproducible soft firing).
-    #[arg(long)]
-    fire_softness: Option<f32>,
+    non_deterministic: bool,
 
     #[command(subcommand)]
     mode: Mode,
@@ -368,16 +352,14 @@ fn main() -> Result<()> {
     // Sampler seed: fixed (reproducible) by default; entropy-seeded with --random-seed (the asides
     // then vary run-to-run, like a chat API). Only interjection CONTENT is affected — the surprisal
     // trigger is greedy and deterministic regardless.
-    let seed = if cli.random_seed { entropy_seed() } else { cli.seed };
-    if cli.random_seed {
-        eprintln!("seed: {seed} (reproduce this run with --seed {seed})");
+    // Determinism: runs are byte-identical by default (Lobe::new already seeds a fixed value and
+    // leaves firing on the hard threshold). --non-deterministic picks a random seed from OS entropy
+    // and softens the firing decision (sigmoid, z-units), so both the asides AND which tokens fire
+    // vary run-to-run. 0.5 is the firing-sigmoid softness — a ~±1z transition band around z_threshold.
+    if cli.non_deterministic {
+        lobe.set_seed(entropy_seed());
+        lobe.set_fire_softness(0.5);
     }
-    lobe.set_seed(seed);
-    // Stochastic firing: explicit --fire-softness wins; otherwise default to soft (0.5) under
-    // --random-seed so triggers vary too, and hard (0) in deterministic mode (preserves the
-    // calibrated hard-threshold default).
-    let fire_softness = cli.fire_softness.unwrap_or(if cli.random_seed { 0.5 } else { 0.0 });
-    lobe.set_fire_softness(fire_softness);
 
     // One config dump so every trace file is self-describing (what produced this run).
     tracing::info!(
@@ -388,7 +370,7 @@ fn main() -> Result<()> {
         dedup = cli.dedup as f64, adapt = cli.adapt as u64, evict = ?cli.evict,
         keep_recent = cli.keep_recent as u64,
         interject_temp = cli.interject_temp as f64, interject_top_p = cli.interject_top_p as f64,
-        seed = seed, random_seed = cli.random_seed, fire_softness = fire_softness as f64,
+        non_deterministic = cli.non_deterministic,
         "run_start"
     );
 
