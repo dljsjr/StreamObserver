@@ -554,9 +554,28 @@ fn process_observe_token(
     Ok(step.fired)
 }
 
-/// Generate + emit the blocking interjection for a fire (non-fused path). The aside is ALWAYS
-/// recorded (anti-fixation lives in the ask's novelty memory); `--dedup` gates only whether the
-/// emit happens, never the recording.
+/// Record a (trimmed) aside and emit it. The aside is ALWAYS recorded — anti-fixation lives in the
+/// ask's novelty memory; `--dedup` (via `interjection_is_novel`) gates only whether it's emitted,
+/// never the recording. Empty → no-op. Shared by the plain interjection and the RAG thought.
+fn record_and_emit_interjection(
+    lobe: &mut Lobe,
+    stream_index: usize,
+    trigger_token: &str,
+    text: &str,
+    out: &mut impl Write,
+) -> Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    let emit = lobe.interjection_is_novel(text);
+    lobe.record_interjection(text);
+    if emit {
+        emit_interjection(out, stream_index, Some(trigger_token), text, false)?;
+    }
+    Ok(())
+}
+
+/// Generate + emit the blocking interjection for a fire (non-fused path).
 fn handle_interjection(
     lobe: &mut Lobe,
     stream_index: usize,
@@ -565,16 +584,7 @@ fn handle_interjection(
     out: &mut impl Write,
 ) -> Result<()> {
     let note = lobe.interject(surprising, max)?;
-    let note = note.trim();
-    if note.is_empty() {
-        return Ok(());
-    }
-    let emit = lobe.interjection_is_novel(note);
-    lobe.record_interjection(note);
-    if emit {
-        emit_interjection(out, stream_index, Some(surprising), note, false)?;
-    }
-    Ok(())
+    record_and_emit_interjection(lobe, stream_index, surprising, note.trim(), out)
 }
 
 /// #8 native tool-calling RAG pass for a fire: the free thought is emitted as an `interjection`, and
@@ -582,13 +592,7 @@ fn handle_interjection(
 /// retrieval, just the thought.
 fn handle_rag(lobe: &mut Lobe, stream_index: usize, surprising: &str, out: &mut impl Write) -> Result<()> {
     let rag_out = lobe.rag(surprising, 160)?;
-    if !rag_out.thought.is_empty() {
-        let emit = lobe.interjection_is_novel(&rag_out.thought);
-        lobe.record_interjection(&rag_out.thought);
-        if emit {
-            emit_interjection(out, stream_index, Some(surprising), &rag_out.thought, false)?;
-        }
-    }
+    record_and_emit_interjection(lobe, stream_index, surprising, rag_out.thought.trim(), out)?;
     if let Some(d) = &rag_out.directive {
         let src = match d.source {
             Source::Mem => "mem",
