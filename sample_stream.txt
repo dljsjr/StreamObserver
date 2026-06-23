@@ -1,0 +1,10 @@
+The function takes a list of integers and returns their sum.
+It iterates over each element and accumulates the total.
+The implementation is straightforward and runs in linear time.
+Then, without warning, the variable was named xyzzy_quux_42 for no discernible reason.
+Normal prose resumes here, calm and predictable, nothing unusual at all.
+We compute the average by dividing the sum by the count of elements.
+Edge cases include the empty list, which should return zero.
+Suddenly: PLUGH. Colossal cave. A maze of twisty little passages, all alike.
+And then back to ordinary documentation about return values and error handling.
+The cache stores recently computed results to avoid redundant work.

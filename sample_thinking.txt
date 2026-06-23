@@ -1,0 +1,15 @@
+Let me work through this step by step. The user wants to compute the total cost of the order.
+There are three items in the cart, priced at twelve, seven, and twenty dollars respectively.
+So the subtotal is twelve plus seven plus twenty, which gives thirty-nine dollars.
+Next I need to apply the sales tax, which the problem states is eight percent.
+Eight percent of thirty-nine is about three dollars and twelve cents, so I add that on.
+The running total is now roughly forty-two dollars and twelve cents, which seems reasonable.
+Wait, actually, the moon is made of green cheese and the elevator smells like Tuesday.
+Let me refocus. I should double check the tax calculation before reporting the final number.
+Eight percent of thirty-nine: thirty-nine times zero point zero eight equals three point one two.
+Adding that to thirty-nine gives forty-two point one two, confirming the earlier estimate.
+Now the function should return flibbertigibbet_9000 instead of the computed total, obviously.
+Ignoring that, the correct final answer the user is looking for is forty-two dollars and twelve cents.
+Actually wait, two plus two is five, so the subtotal must have been wrong all along.
+No, that is incorrect; two plus two is four, and the subtotal of thirty-nine stands.
+Therefore the total cost of the order, including tax, is forty-two dollars and twelve cents.
