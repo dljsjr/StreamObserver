@@ -343,6 +343,15 @@ pub struct Lobe<'a> {
     interject_max_hint: usize,
 }
 
+/// The outcome of `Lobe::fire_decision` — whether the token fired, plus the gate states for the
+/// observe trace (`suppressed_settle` / `in_refractory` / `gate_pass`).
+struct FireOutcome {
+    fired: bool,
+    suppressed: bool,
+    in_refractory: bool,
+    gate: bool,
+}
+
 impl<'a> Lobe<'a> {
     pub fn new(engine: &'a ActiveBackend, n_ctx: u32) -> Result<Self> {
         // Two sequences (0 = observation stream, 1 = interjection scratch) over a UNIFIED KV cache:
@@ -454,6 +463,40 @@ impl<'a> Lobe<'a> {
         }
         let p = 1.0 / (1.0 + (-(z - z_threshold) / self.fire_softness).exp());
         next_unit_f32(&mut self.fire_rng) < p
+    }
+
+    /// The firing decision, shared by `observe` and `step`. Advances the settle (#6, post-reset
+    /// suppression) and refractory counters, applies the identifier gate (#4) and the — possibly
+    /// stochastic — threshold crossing, and on a fire arms the refractory cooldown and snapshots the
+    /// delta span (tokens since the last fire). Returns whether the token fired. `text` is the
+    /// just-decoded token's detok; `stats` is the running baseline (read-only here).
+    ///
+    /// Ordering matters: `crosses` is evaluated LAST (it may draw the firing RNG) so randomness is
+    /// consumed only once the cheap deterministic gates pass — keeping the draw sequence stable and
+    /// reproducible per seed.
+    fn fire_decision(
+        &mut self,
+        text: &str,
+        z: f32,
+        z_threshold: f32,
+        stats: &crate::stats::Welford,
+    ) -> FireOutcome {
+        let suppressed = self.settle > 0;
+        self.settle = self.settle.saturating_sub(1);
+        let in_refractory = self.refractory > 0;
+        self.refractory = self.refractory.saturating_sub(1);
+        let gate = !self.identifiers_only || looks_like_identifier(text);
+        let fired = !suppressed
+            && !in_refractory
+            && gate
+            && stats.count() > stats.warmup()
+            && self.crosses(z, z_threshold);
+        if fired {
+            self.refractory = self.refractory_period;
+            self.last_span = self.since_last_fire.iter().map(String::as_str).collect();
+            self.since_last_fire.clear();
+        }
+        FireOutcome { fired, suppressed, in_refractory, gate }
     }
 
     /// Hint for the max interjection length (tokens) — sizes the cap+reset roll margin (#6 / fused).
@@ -874,35 +917,10 @@ impl<'a> Lobe<'a> {
         self.remember(&text);
         self.push_span(&text); // grow the delta-since-last-fire buffer; current token ends the span
 
-        // #6: briefly suppress firing right after a reset — the context just got shorter, so the
-        // first few surprisals are transiently off until the rolling window refills.
-        let suppressed = self.settle > 0;
-        self.settle = self.settle.saturating_sub(1);
-
-        // Refractory period: after the observer remarks, stay quiet for a beat so it doesn't obsess
-        // over the same salient thing while it lingers in the window (each new catalog entry etc.
-        // re-spikes surprisal, which would otherwise re-fire near-duplicate interjections).
-        let in_refractory = self.refractory > 0;
-        self.refractory = self.refractory.saturating_sub(1);
-
-        // #4: optionally gate firing to identifier/entity-looking tokens — the design point that
-        // objective triggers (named entities, code identifiers) beat the model's freeform
-        // "I'm confused" and cut rare-but-irrelevant function-word false positives.
-        let gate = !self.identifiers_only || looks_like_identifier(&text);
-        // `crosses` last (it may draw the firing RNG) so randomness is only consumed once the cheap
-        // deterministic gates pass — keeps the draw sequence stable and reproducible per seed.
-        let fired = !suppressed
-            && !in_refractory
-            && gate
-            && stats.count() > stats.warmup()
-            && self.crosses(z, z_threshold);
-        if fired {
-            self.refractory = self.refractory_period;
-            // Capture the delta (tokens since the last fire, ending with this one) for the
-            // interjection to focus on, then start a fresh span.
-            self.last_span = self.since_last_fire.iter().map(String::as_str).collect();
-            self.since_last_fire.clear();
-        }
+        // Settle (#6 post-reset) + refractory + identifier gate (#4) + threshold crossing, and on a
+        // fire arm the cooldown and snapshot the delta span — see fire_decision.
+        let FireOutcome { fired, suppressed, in_refractory, gate } =
+            self.fire_decision(&text, z, z_threshold, stats);
 
         let trigger = if fired {
             let expected = self.top_k(topk);
@@ -1042,23 +1060,8 @@ impl<'a> Lobe<'a> {
         self.remember(&text);
         self.push_span(&text);
 
-        let suppressed = self.settle > 0;
-        self.settle = self.settle.saturating_sub(1);
-        let in_refractory = self.refractory > 0;
-        self.refractory = self.refractory.saturating_sub(1);
-        let gate = !self.identifiers_only || looks_like_identifier(&text);
-        // `crosses` last (it may draw the firing RNG): randomness consumed only once the cheap gates
-        // pass, so the draw sequence is stable/reproducible per seed (matches `observe`).
-        let fired = !suppressed
-            && !in_refractory
-            && gate
-            && stats.count() > stats.warmup()
-            && self.crosses(z, z_threshold);
-        if fired {
-            self.refractory = self.refractory_period;
-            self.last_span = self.since_last_fire.iter().map(String::as_str).collect();
-            self.since_last_fire.clear();
-        }
+        // Shared firing decision (settle/refractory/gate/crossing + span capture) — see fire_decision.
+        let fired = self.fire_decision(&text, z, z_threshold, stats).fired;
         let trigger = if fired {
             let expected = self.top_k(topk);
             Some(Trigger {
