@@ -1,0 +1,40 @@
+# Rust build output
+/target
+
+# Large model weights (download separately; see CLAUDE.md "Run")
+/models/
+*.gguf
+
+# Large downloaded corpora for infinite-context streaming tests (regenerable)
+/corpus/
+
+# Generated run artifacts (JSONL sweeps, logs, offline threshold sweeps)
+*.jsonl
+*.log
+steps.txt
+
+# Scratch / throwaway test inputs (we generate these into /tmp or ./scratch during calibration —
+# corpus slices, hand-built anomaly streams, A/B fixtures). Keep committed samples (sample_*.txt).
+/scratch/
+*.scratch
+
+# Profiling / perf output (Instruments, cargo-flamegraph, heaptrack)
+*.trace
+perf.data*
+flamegraph.svg
+*.heap
+
+# rustfmt backups
+*.rs.bk
+
+# macOS
+.DS_Store
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# Note: Cargo.lock is intentionally NOT ignored — this is a binary crate, so the
+# lockfile is committed for reproducible builds.

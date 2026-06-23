@@ -1,0 +1,53 @@
+[package]
+name = "streaming-lobe"
+version = "0.1.0"
+edition = "2021"
+description = "A small local model that observes a token stream and flags surprising tokens (a 'limbic' observer lobe)."
+
+[dependencies]
+# Thin, close-to-raw bindings that track upstream llama.cpp. The thinness is the point:
+# it exposes the low-level decode/logits surface we need.
+#
+# default-features = false is deliberate on macOS: the crate's defaults include `openmp`,
+# whose cmake `find_package(OpenMP)` routinely fails to locate Homebrew's libomp under
+# Apple clang and breaks the native build. We use only the low-level decode/logits/tokenize
+# surface — none of it is gated behind `common`/`openmp` — so dropping the defaults is free
+# and also trims the native compile. Backend (metal/cuda/vulkan) is opted in via features below.
+# Optional: gated behind the `llama` feature (the default backend). `candle` will gate the Candle
+# backend's deps (added at bring-up). One backend compiles at a time — see docs/BACKEND.md.
+llama-cpp-2 = { version = "0.1", default-features = false, optional = true }
+ratatui = "0.29"
+crossterm = "0.28"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+serde_json = "1"
+
+# Structured observability (--debug-log): deep, granular JSONL tracing of every observe/
+# interject/roll/rag event, gated behind a flag and zero-overhead when no subscriber is installed.
+# `json` → one JSON object per event; `env-filter` → per-target level control; tracing-appender →
+# non-blocking file writer so logging never stalls the decode loop.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+tracing-appender = "0.2"
+tachyonfx = "0.21"
+
+# Backend selection is a feature passthrough to llama-cpp-2.
+#   macOS / Apple Silicon:  cargo run --release --features metal -- ...
+#   NVIDIA:                 cargo run --release --features cuda  -- ...
+#   CPU only (default):     cargo run --release             -- ...
+# NOTE: if these feature names differ in your installed llama-cpp-2 version,
+# check that crate's Cargo.toml ([features]) and adjust.
+[features]
+# Backend selection (exactly one): `llama` (default) or `candle` (bring-up, see docs/BACKEND.md).
+default = ["llama"]
+llama = ["dep:llama-cpp-2"]
+candle = [] # candle-core / candle-nn / tokenizers added when the forward pass is implemented
+# Accelerator passthrough to llama-cpp-2 (the `?` means it only applies when `llama` is enabled):
+#   macOS / Apple Silicon:  cargo build --release --features metal   (= default llama + metal)
+#   NVIDIA:                 cargo build --release --features cuda
+metal = ["llama-cpp-2?/metal"]
+cuda = ["llama-cpp-2?/cuda"]
+vulkan = ["llama-cpp-2?/vulkan"]
+
+[profile.release]
+opt-level = 3
