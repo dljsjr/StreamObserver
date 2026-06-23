@@ -28,7 +28,7 @@ use std::io::{BufRead, Write};
 use std::time::Instant;
 
 use backend::{ActiveBackend, Backend};
-use lobe::{AskMode, EvictMode, InterjectMode, Lobe, NoveltyMode, Signal, Source};
+use lobe::{AskMode, EvictMode, InterjectMode, Lobe, NoveltyMode, Signal, Source, Step, Trigger};
 use stats::Welford;
 
 /// Retriever seam (#8). The real backends — file-memory for `mem` (this session's stored context),
@@ -434,6 +434,176 @@ fn main() -> Result<()> {
 
 /// Headless: stdin -> scored tokens -> JSONL on stdout.
 ///
+/// Write a `trigger` JSONL event. `with_expected` attaches the model's top-k expectations (the
+/// non-fused path includes them; the fused path keeps the line lean).
+fn emit_trigger(out: &mut impl Write, t: &Trigger, signal: &str, pos: i32, with_expected: bool) -> Result<()> {
+    let mut ev = serde_json::json!({
+        "event": "trigger", "stream_index": t.stream_index, "token": t.token_text,
+        "surprisal": t.surprisal, "entropy": t.entropy, "z": t.z, "signal": signal, "pos": pos,
+    });
+    if with_expected {
+        let expected: Vec<_> = t
+            .expected
+            .iter()
+            .map(|(s, p)| serde_json::json!({ "tok": s, "p": p }))
+            .collect();
+        ev["expected"] = serde_json::json!(expected);
+    }
+    writeln!(out, "{ev}")?;
+    Ok(())
+}
+
+/// Write an `interjection` JSONL event. `trigger_token` is attached on the non-fused path (the fused
+/// one tags by stream_index only) and `fused` flags which path produced it.
+fn emit_interjection(
+    out: &mut impl Write,
+    stream_index: usize,
+    trigger_token: Option<&str>,
+    text: &str,
+    fused: bool,
+) -> Result<()> {
+    let mut ev = serde_json::json!({ "event": "interjection", "stream_index": stream_index, "text": text });
+    if let Some(tok) = trigger_token {
+        ev["trigger_token"] = serde_json::json!(tok);
+    }
+    if fused {
+        ev["fused"] = serde_json::json!(true);
+    }
+    writeln!(out, "{ev}")?;
+    Ok(())
+}
+
+/// Write a uniform per-token `step` JSONL event (`--all-steps`).
+fn emit_step(out: &mut impl Write, step: &Step, signal: &str, pos: i32) -> Result<()> {
+    let ev = serde_json::json!({
+        "event": "step", "stream_index": step.stream_index, "token": step.token_text,
+        "surprisal": step.surprisal, "entropy": step.entropy, "z": step.z, "signal": signal, "pos": pos,
+    });
+    writeln!(out, "{ev}")?;
+    Ok(())
+}
+
+/// One stream token on the FUSED path: co-batch observation + any in-flight interjection in a single
+/// `step()`, emitting the trigger and (when the concurrent aside completes) the interjection.
+fn process_fused_token(
+    lobe: &mut Lobe,
+    tok: backend::Token,
+    stats: &mut Welford,
+    cli: &Cli,
+    signal: &str,
+    out: &mut impl Write,
+) -> Result<()> {
+    let outcome = lobe.step(tok, stats, cli.z, cli.topk, cli.interject_max)?;
+    let pos = lobe.position();
+    if let Some(t) = &outcome.step.trigger {
+        emit_trigger(out, t, signal, pos, false)?;
+    }
+    match outcome.interjection {
+        lobe::InterjectStatus::Working(partial) => {
+            // early-abort a known duplicate (exercises the abort path)
+            if lobe.interjection_doomed(&partial) {
+                lobe.abort_interjection()?;
+            }
+        }
+        lobe::InterjectStatus::Done(text) => {
+            let text = text.trim();
+            if !text.is_empty() {
+                emit_interjection(out, outcome.step.stream_index, None, text, true)?;
+                lobe.record_interjection(text);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// One stream token on the NON-fused path: observe, emit the trigger, then (blocking) the optional
+/// interjection and #8 RAG, plus the `--all-steps` event. Returns whether the token fired.
+#[allow(clippy::too_many_arguments)]
+fn process_observe_token(
+    lobe: &mut Lobe,
+    tok: backend::Token,
+    stats: &mut Welford,
+    cli: &Cli,
+    signal: &str,
+    interject: bool,
+    rag: bool,
+    all_steps: bool,
+    out: &mut impl Write,
+) -> Result<bool> {
+    let step = lobe.observe(tok, stats, cli.z, cli.topk)?;
+    let pos = lobe.position(); // post-decode KV position; sawtooths under cap+reset
+
+    if let Some(t) = &step.trigger {
+        emit_trigger(out, t, signal, pos, true)?;
+        // Clone the trigger token out before mutably borrowing lobe for generation (t borrows step).
+        let stream_index = t.stream_index;
+        let surprising = t.token_text.clone();
+        if interject {
+            handle_interjection(lobe, stream_index, &surprising, cli.interject_max, out)?;
+        }
+        if rag {
+            handle_rag(lobe, stream_index, &surprising, out)?;
+        }
+    }
+
+    // --all-steps: a uniform per-token `step` for EVERY observed token, alongside any trigger above.
+    if all_steps {
+        emit_step(out, &step, signal, pos)?;
+    }
+    Ok(step.fired)
+}
+
+/// Generate + emit the blocking interjection for a fire (non-fused path). The aside is ALWAYS
+/// recorded (anti-fixation lives in the ask's novelty memory); `--dedup` gates only whether the
+/// emit happens, never the recording.
+fn handle_interjection(
+    lobe: &mut Lobe,
+    stream_index: usize,
+    surprising: &str,
+    max: usize,
+    out: &mut impl Write,
+) -> Result<()> {
+    let note = lobe.interject(surprising, max)?;
+    let note = note.trim();
+    if note.is_empty() {
+        return Ok(());
+    }
+    let emit = lobe.interjection_is_novel(note);
+    lobe.record_interjection(note);
+    if emit {
+        emit_interjection(out, stream_index, Some(surprising), note, false)?;
+    }
+    Ok(())
+}
+
+/// #8 native tool-calling RAG pass for a fire: the free thought is emitted as an `interjection`, and
+/// a parsed tool call drives a `retrieval` event through the `run_retrieval` stub. Abstain → no
+/// retrieval, just the thought.
+fn handle_rag(lobe: &mut Lobe, stream_index: usize, surprising: &str, out: &mut impl Write) -> Result<()> {
+    let rag_out = lobe.rag(surprising, 160)?;
+    if !rag_out.thought.is_empty() {
+        let emit = lobe.interjection_is_novel(&rag_out.thought);
+        lobe.record_interjection(&rag_out.thought);
+        if emit {
+            emit_interjection(out, stream_index, Some(surprising), &rag_out.thought, false)?;
+        }
+    }
+    if let Some(d) = &rag_out.directive {
+        let src = match d.source {
+            Source::Mem => "mem",
+            Source::Rag => "rag",
+        };
+        let snippet = run_retrieval(d.source, &d.query);
+        let rev = serde_json::json!({
+            "event": "retrieval", "stream_index": stream_index, "source": src,
+            "query": d.query, "found": snippet.is_some(), "snippet": snippet,
+        });
+        writeln!(out, "{rev}")?;
+    }
+    Ok(())
+}
+
 /// Each input chunk (line or word) is tokenized and each of its tokens is observed and
 /// scored individually, so a single noisy line can produce several events. Designed to
 /// be piped: `cat thinking_stream.txt | streaming-lobe --model m.gguf headless`.
@@ -446,7 +616,6 @@ fn run_headless(
     fused: bool,
 ) -> Result<()> {
     let interject = cli.interject_on(); // global flag (on by default; --no-interject disables)
-    let interject_max = cli.interject_max;
     let mut stats = Welford::new(cli.warmup, cli.adapt);
     let signal_name = match cli.signal {
         Signal::Surprisal => "surprisal",
@@ -477,178 +646,42 @@ fn run_headless(
             // add_bos=false: stream tokens are a continuation of the pinned preamble.
             let tokens = lobe.tokenize(&chunk, false)?;
             for tok in tokens {
-                // FUSED concurrent path (--fused): one decode per stream token carries observation
-                // AND any in-flight interjection. The interjection emits ~N tokens after its trigger
-                // (concurrent), tagged with the trigger's stream_index. Exercises the same `step()`
-                // the TUI uses — this is how the fused path is verified without a TTY.
+                // Two per-token paths (see the helpers): FUSED co-batches observation + an in-flight
+                // interjection in one step(); the default path observes then blocks on the optional
+                // interjection / #8 RAG. Both share the counters + periodic stats below.
                 if fused {
-                    let outcome = lobe.step(tok, &mut stats, cli.z, cli.topk, interject_max)?;
-                    let step_pos = lobe.position();
-                    if let Some(t) = &outcome.step.trigger {
-                        let ev = serde_json::json!({
-                            "event": "trigger", "stream_index": t.stream_index, "token": t.token_text,
-                            "surprisal": t.surprisal, "entropy": t.entropy, "z": t.z,
-                            "signal": signal_name, "pos": step_pos,
-                        });
-                        writeln!(out, "{ev}")?;
+                    process_fused_token(lobe, tok, &mut stats, cli, signal_name, &mut out)?;
+                } else {
+                    let fired = process_observe_token(
+                        lobe, tok, &mut stats, cli, signal_name, interject, rag, all_steps, &mut out,
+                    )?;
+                    // Flush promptly on triggers so live consumers see them; plain steps stay buffered
+                    // for throughput when piping --all-steps to a file.
+                    if fired {
+                        out.flush()?;
                     }
-                    match outcome.interjection {
-                        lobe::InterjectStatus::Working(partial) => {
-                            // early-abort a known duplicate (exercises the abort path)
-                            if lobe.interjection_doomed(&partial) {
-                                lobe.abort_interjection()?;
-                            }
-                        }
-                        lobe::InterjectStatus::Done(text) => {
-                            let text = text.trim();
-                            if !text.is_empty() {
-                                let iev = serde_json::json!({
-                                    "event": "interjection", "stream_index": outcome.step.stream_index,
-                                    "text": text, "fused": true,
-                                });
-                                writeln!(out, "{iev}")?;
-                                lobe.record_interjection(text);
-                            }
-                        }
-                        _ => {}
-                    }
-                    tok_count += 1;
-                    window_count += 1;
-                    if cli.stats && window_count >= FUSED_STATS_EVERY {
-                        let dt = t_window.elapsed().as_secs_f64().max(1e-9);
-                        let (s0, gen, inflight) = lobe.kv_debug(); // FUSED_CACHE_GO_NOGO §3
+                }
+
+                tok_count += 1;
+                window_count += 1;
+                // Periodic throughput / eviction stats (stderr only — never pollutes stdout JSONL).
+                // The fused path dumps KV occupancy at a tighter cadence (FUSED_CACHE_GO_NOGO §3).
+                let stats_every = if fused { FUSED_STATS_EVERY } else { STATS_EVERY };
+                if cli.stats && window_count >= stats_every {
+                    let dt = t_window.elapsed().as_secs_f64().max(1e-9);
+                    if fused {
+                        let (s0, gen, inflight) = lobe.kv_debug();
                         eprintln!(
                             "[kv] tok={tok_count} resets={} pos={} seq0_max={s0} gen_max={gen} \
                              gen_inflight={inflight} tok/s={:.0}",
                             lobe.resets(), lobe.position(), window_count as f64 / dt,
                         );
-                        t_window = Instant::now();
-                        window_count = 0;
+                    } else {
+                        eprintln!(
+                            "[stats] tok={tok_count} resets={} pos={} window_tok/s={:.0}",
+                            lobe.resets(), lobe.position(), window_count as f64 / dt,
+                        );
                     }
-                    continue;
-                }
-
-                let step = lobe.observe(tok, &mut stats, cli.z, cli.topk)?;
-                let step_pos = lobe.position(); // post-decode KV position; sawtooths under cap+reset
-
-                if let Some(t) = &step.trigger {
-                    let expected: Vec<_> = t
-                        .expected
-                        .iter()
-                        .map(|(s, p)| serde_json::json!({ "tok": s, "p": p }))
-                        .collect();
-                    let ev = serde_json::json!({
-                        "event": "trigger",
-                        "stream_index": t.stream_index,
-                        "token": t.token_text,
-                        "surprisal": t.surprisal,
-                        "entropy": t.entropy,
-                        "z": t.z,
-                        "signal": signal_name,
-                        "pos": step_pos,
-                        "expected": expected,
-                    });
-                    writeln!(out, "{ev}")?;
-
-                    // observe -> generate -> resume: a chat-framed observation on a scratch
-                    // sequence, emitted as its own event. Captured before any borrow of lobe
-                    // conflicts (t borrows step, not lobe).
-                    if interject {
-                        let stream_index = t.stream_index;
-                        let surprising = t.token_text.clone();
-                        let note = lobe.interject(&surprising, interject_max)?;
-                        let note = note.trim();
-                        // Anti-fixation lives in the ask now (1b novelty memory), so ALWAYS record
-                        // for the next ask. `interjection_is_novel` is an opt-in backstop, inert at
-                        // the default --dedup 0, that suppresses only the emit (not the memory).
-                        if !note.is_empty() {
-                            let emit = lobe.interjection_is_novel(note);
-                            lobe.record_interjection(note);
-                            if emit {
-                                let iev = serde_json::json!({
-                                    "event": "interjection",
-                                    "stream_index": stream_index,
-                                    "trigger_token": surprising,
-                                    "text": note,
-                                });
-                                writeln!(out, "{iev}")?;
-                            }
-                        }
-                    }
-
-                    // #8: native tool-calling RAG hook. The observer thinks, and (if warranted)
-                    // emits a native tool call we parse into a retrieval directive. The free thought
-                    // is an `interjection`; the directive (if any) drives a `retrieval` event via the
-                    // stub seam. Abstain (no call) → just the thought, no retrieval.
-                    if rag {
-                        let stream_index = t.stream_index;
-                        let surprising = t.token_text.clone();
-                        let rag_out = lobe.rag(&surprising, 160)?;
-                        if !rag_out.thought.is_empty() {
-                            let emit = lobe.interjection_is_novel(&rag_out.thought);
-                            lobe.record_interjection(&rag_out.thought);
-                            if emit {
-                                let iev = serde_json::json!({
-                                    "event": "interjection",
-                                    "stream_index": stream_index,
-                                    "trigger_token": surprising,
-                                    "text": rag_out.thought,
-                                });
-                                writeln!(out, "{iev}")?;
-                            }
-                        }
-                        if let Some(d) = &rag_out.directive {
-                            let src = match d.source {
-                                Source::Mem => "mem",
-                                Source::Rag => "rag",
-                            };
-                            let snippet = run_retrieval(d.source, &d.query);
-                            let rev = serde_json::json!({
-                                "event": "retrieval",
-                                "stream_index": stream_index,
-                                "source": src,
-                                "query": d.query,
-                                "found": snippet.is_some(),
-                                "snippet": snippet,
-                            });
-                            writeln!(out, "{rev}")?;
-                        }
-                    }
-                }
-
-                // With --all-steps, emit a uniform per-token `step` for EVERY observed token,
-                // fired ones included, so an offline sweep gets a complete single-event stream.
-                // Triggers (above) are emitted alongside these, not instead of them.
-                if all_steps {
-                    let ev = serde_json::json!({
-                        "event": "step",
-                        "stream_index": step.stream_index,
-                        "token": step.token_text,
-                        "surprisal": step.surprisal,
-                        "entropy": step.entropy,
-                        "z": step.z,
-                        "signal": signal_name,
-                        "pos": step_pos,
-                    });
-                    writeln!(out, "{ev}")?;
-                }
-
-                // Flush promptly on triggers so live consumers see them; plain steps stay
-                // buffered for throughput when piping --all-steps to a file.
-                if step.fired {
-                    out.flush()?;
-                }
-
-                tok_count += 1;
-                window_count += 1;
-                if cli.stats && window_count >= STATS_EVERY {
-                    let dt = t_window.elapsed().as_secs_f64().max(1e-9);
-                    eprintln!(
-                        "[stats] tok={tok_count} resets={} pos={} window_tok/s={:.0}",
-                        lobe.resets(),
-                        lobe.position(),
-                        window_count as f64 / dt,
-                    );
                     t_window = Instant::now();
                     window_count = 0;
                 }
