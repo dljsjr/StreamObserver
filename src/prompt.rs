@@ -48,22 +48,25 @@ pub fn interject_prompt_snippet(recent: &str) -> String {
 /// `novelty_block`/`novelty_clause` pre-resolved by the caller (empty strings to omit).
 pub fn interject_ask_context(
     span: &str,
+    recall_block: &str,
     novelty_block: &str,
     novelty_clause: &str,
     continuous: bool,
 ) -> String {
+    // `recall_block` (#8 RAG, voiced): an optional "something here stirs a memory: …" passage spliced
+    // after the span, so the persona weaves a retrieved memory into its aside IN VOICE (empty = none).
     if continuous {
         format!(
             "<turn|>\n<|turn>user\nYou've been musing as you read, and the text has moved on \
-             to:\n\n\u{201c}{span}\u{201d}{novelty_block}\n\nGo on — pick up your running commentary in \
-             your own voice{novelty_clause}.<turn|>\n<|turn>model\n",
+             to:\n\n\u{201c}{span}\u{201d}{recall_block}{novelty_block}\n\nGo on — pick up your running \
+             commentary in your own voice{novelty_clause}.<turn|>\n<|turn>model\n",
         )
     } else {
         format!(
             "<turn|>\n<|turn>user\nHere is the passage the text has just reached, quoted for you \
-             to comment on (not continue):\n\n\u{201c}{span}\u{201d}{novelty_block}\n\nGive your aside \
-             on it — what's happening here, what it's doing, what it means, and how it connects \
-             to what came before{novelty_clause}.<turn|>\n<|turn>model\n",
+             to comment on (not continue):\n\n\u{201c}{span}\u{201d}{recall_block}{novelty_block}\n\nGive \
+             your aside on it — what's happening here, what it's doing, what it means, and how it \
+             connects to what came before{novelty_clause}.<turn|>\n<|turn>model\n",
         )
     }
 }
@@ -113,20 +116,28 @@ mod tests {
 
     #[test]
     fn context_ask_closes_then_opens_user_and_model_turns() {
-        let a = interject_ask_context("SPAN", "", "", false);
+        let a = interject_ask_context("SPAN", "", "", "", false);
         assert!(a.starts_with("<turn|>\n<|turn>user\n")); // closes the open model turn, opens user
         assert!(a.ends_with("<|turn>model\n")); // opens the model turn for the aside
         assert!(a.contains("\u{201c}SPAN\u{201d}")); // span is curly-quoted
         // Passage framing, not Continuous.
         assert!(a.contains("comment on (not continue)"));
-        assert!(interject_ask_context("S", "", "", true).contains("pick up your running commentary"));
+        assert!(interject_ask_context("S", "", "", "", true).contains("pick up your running commentary"));
     }
 
     #[test]
     fn context_ask_injects_novelty_block_and_clause() {
-        let a = interject_ask_context("S", "\n\nYou recently said:\n- foo", " — fresh angle", false);
+        let a = interject_ask_context("S", "", "\n\nYou recently said:\n- foo", " — fresh angle", false);
         assert!(a.contains("You recently said:\n- foo"));
         assert!(a.contains(" — fresh angle"));
+    }
+
+    #[test]
+    fn context_ask_splices_the_recall_block_after_the_span() {
+        let a = interject_ask_context("SPAN", " [recalled: whales]", "", "", false);
+        let span_at = a.find("SPAN").unwrap();
+        let recall_at = a.find("[recalled: whales]").unwrap();
+        assert!(span_at < recall_at, "recall block follows the span");
     }
 
     #[test]

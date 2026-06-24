@@ -614,26 +614,25 @@ fn handle_interjection(
     max: usize,
     out: &mut impl Write,
 ) -> Result<()> {
-    let note = lobe.interject(surprising, max)?;
+    let note = lobe.interject(surprising, max, None)?;
     record_and_emit_interjection(lobe, stream_index, surprising, note.trim(), out)
 }
 
-/// Run the blocking #8 RAG pass for a fire (used by the live frontends when `--rag` is on — it
-/// serializes with the stream) and return the aside to display: the grounded reply when retrieval
-/// hit, else the free thought. Also returns the retrieved snippet (for frontends that surface it).
+/// Produce a VOICED, retrieval-enriched aside for a fire (the live `--rag` path — option E). Retrieve
+/// on the surprising entity, then run the normal persona-fork interjection with the snippet spliced
+/// into its ask, so the persona weaves the recalled passage into its musing IN VOICE — rather than a
+/// separate voiceless RAG reply. The retrieval embed/search briefly serializes with the stream (by
+/// design). No hit → an ordinary (un-enriched) interjection. Returns (aside, retrieved snippet).
 pub(crate) fn rag_aside(
     lobe: &mut Lobe,
     surprising: &str,
     max: usize,
     retrieve: &mut dyn FnMut(&str) -> Option<String>,
 ) -> Result<(String, Option<String>)> {
-    let out = lobe.rag(surprising, max, |_source, query| retrieve(query))?;
-    let aside = out
-        .response
-        .filter(|r| !r.is_empty())
-        .unwrap_or(out.thought);
+    let snippet = retrieve(surprising); // query on the entity that surprised him
+    let aside = lobe.interject(surprising, max, snippet.as_deref())?;
     lobe.record_interjection(&aside); // keep the novelty memory populated across fires
-    Ok((aside, out.retrieved))
+    Ok((aside, snippet))
 }
 
 /// The harrier query instruction (#8 semantic retrieval). harrier needs a one-sentence task

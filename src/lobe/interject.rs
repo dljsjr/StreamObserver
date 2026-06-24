@@ -230,7 +230,7 @@ impl<B: Backend> Lobe<'_, B> {
                 // `self.pos` is the small pinned-prefix+window, so the fork+ask+gen fits exactly,
                 // never an estimate. Re-tokenize after the roll (the span/novelty text is unchanged,
                 // but `self.recent`/`last_span` survive the roll so the ask is identical anyway).
-                let ask = self.interject_ask_context();
+                let ask = self.interject_ask_context(None);
                 let mut toks = self.tokenize(&ask, false)?;
                 // Footprint above the fork = ask (GEN_SEQ) + gen tokens (GEN_SEQ) + seq-0's growth
                 // during the deferred-roll generation (BOTH sequences grow concurrently) ≈
@@ -241,7 +241,7 @@ impl<B: Backend> Lobe<'_, B> {
                     && self.pos + toks.len() as i32 + 2 * gen_ceiling + 32 > self.n_ctx
                 {
                     self.roll()?;
-                    let ask = self.interject_ask_context();
+                    let ask = self.interject_ask_context(None);
                     toks = self.tokenize(&ask, false)?;
                 }
                 self.session.copy_seq(0, GEN_SEQ as u32)?;
@@ -292,7 +292,7 @@ impl<B: Backend> Lobe<'_, B> {
     /// context). Closes the in-progress turn, then a user turn that spotlights the *delta* — the
     /// span of text since the last fire — plus NOVELTY MEMORY (what it just said), then opens the
     /// model turn.
-    fn interject_ask_context(&self) -> String {
+    fn interject_ask_context(&self, recalled: Option<&str>) -> String {
         // The surprisal spike is purely the HARNESS trigger — it decides WHEN to interject, nothing
         // more. The aside is NOT conditioned on "what was surprising"; the model simply discusses the
         // current chunk (the delta span — the text since the last fire). The surprising token is never
@@ -326,10 +326,23 @@ impl<B: Backend> Lobe<'_, B> {
             NoveltyMode::Form => " — but vary your rhythm and how you begin, not just the subject",
             NoveltyMode::Off => "",
         };
+        // Recalled passage (#8 RAG, voiced): when retrieval surfaced something, splice it in so the
+        // PERSONA weaves the memory into its aside in voice — instead of a separate voiceless RAG
+        // reply. Empty when there's no hit (then this is an ordinary interjection).
+        let recall_block = match recalled {
+            Some(s) if !s.trim().is_empty() => format!(
+                "\n\nSomething here stirs a memory — elsewhere the text says:\n\u{201c}{}\u{201d}\nLet it \
+                 colour your reflection if it resonates.",
+                s.trim()
+            ),
+            _ => String::new(),
+        };
+
         // Ask framing (H2): Passage = "comment on this quoted span" (control); Continuous = pick up an
         // ongoing thread. Template: prompt::interject_ask_context.
         crate::prompt::interject_ask_context(
             span,
+            &recall_block,
             &novelty_block,
             novelty_clause,
             self.icfg.ask_mode == AskMode::Continuous,
@@ -344,8 +357,8 @@ impl<B: Backend> Lobe<'_, B> {
     /// `self.last_logits` are never touched, so observation is byte-identical with or without it.
     /// It's a *reframe*, not a continuation — the (instruct-tuned) observer reacts to the stream
     /// rather than extends it. Greedy, capped at `max`, stopping at any turn boundary.
-    pub fn interject(&mut self, surprising: &str, max: usize) -> Result<String> {
-        self.interject_begin(surprising, max)?;
+    pub fn interject(&mut self, surprising: &str, max: usize, recalled: Option<&str>) -> Result<String> {
+        self.interject_begin(surprising, max, recalled)?;
         loop {
             match self.interject_step()? {
                 InterjectStep::Done(text) => return Ok(text),
@@ -362,7 +375,7 @@ impl<B: Backend> Lobe<'_, B> {
     /// In `Context` mode this forks the observer's full live context (seq 0) onto `GEN_SEQ` with a
     /// cheap cell copy (no recompute) and the ask continues from `self.pos`; in `Snippet` mode it
     /// stages a fresh re-encoded prompt from position 0.
-    pub fn interject_begin(&mut self, surprising: &str, max: usize) -> Result<()> {
+    pub fn interject_begin(&mut self, surprising: &str, max: usize, recalled: Option<&str>) -> Result<()> {
         let t_start = std::time::Instant::now();
         self.session.clear_seq(GEN_SEQ as u32)?;
         let forked = matches!(self.icfg.mode, InterjectMode::Context);
@@ -372,7 +385,7 @@ impl<B: Backend> Lobe<'_, B> {
             InterjectMode::Snippet => self.interject_prompt_snippet(),
             InterjectMode::Context => {
                 self.session.copy_seq(0, GEN_SEQ as u32)?;
-                self.interject_ask_context()
+                self.interject_ask_context(recalled)
             }
         };
         let toks = self.tokenize(&prompt_text, !forked)?; // BOS only for the standalone snippet prompt
