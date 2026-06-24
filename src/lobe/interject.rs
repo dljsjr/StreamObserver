@@ -94,6 +94,44 @@ impl Default for InterjectConfig {
     }
 }
 
+/// In-flight interjection generation RUNTIME state: the timesliced FSM (`fsm`, headless one-shot) and
+/// the fused concurrent cursors (the `*` fields, the TUI path co-batched in `Lobe::step`), plus the
+/// interjection sampler RNG. Runtime state, not config — lives alongside the generation logic.
+pub(crate) struct GenState {
+    /// In-flight streaming interjection (timesliced, pumped by `interject_step`); None when idle.
+    pub fsm: Option<InterjectState>,
+    // --- Fused concurrent forward pass (CONCURRENT_FORWARD_PASS.md, TUI path) ---
+    /// Is an interjection generating on GEN_SEQ right now (fused mode)?
+    pub in_flight: bool,
+    /// GEN_SEQ's position cursor, independent of seq-0's `pos`.
+    pub pos: i32,
+    /// The GEN_SEQ token to decode next tick (sampled from last tick's gen logits).
+    pub pending: Option<Token>,
+    /// Accumulated interjection text so far (fused mode).
+    pub out: String,
+    /// Interjection tokens produced so far, and the cap.
+    pub produced: usize,
+    pub max: usize,
+    /// xorshift64 state for interjection sampling; constant-seeded so a run is reproducible
+    /// (overridden via `Lobe::set_seed`).
+    pub rng: u64,
+}
+
+impl Default for GenState {
+    fn default() -> Self {
+        Self {
+            fsm: None,
+            in_flight: false,
+            pos: 0,
+            pending: None,
+            out: String::new(),
+            produced: 0,
+            max: 0,
+            rng: 0x9E3779B97F4A7C15, // fixed seed → reproducible runs
+        }
+    }
+}
+
 impl Lobe<'_> {
     /// Fork seq 0 onto GEN_SEQ and prefill the interjection ask in ONE decode (the single
     /// per-interjection stall), then seed the fused gen cursors. Subsequent reply tokens co-batch in
@@ -136,20 +174,20 @@ impl Lobe<'_> {
             &logits,
             self.icfg.temp,
             self.icfg.top_p,
-            &mut self.rng_state,
+            &mut self.gen.rng,
         );
-        self.gen_pos = start_pos + toks.len() as i32;
-        self.gen_out.clear();
-        self.gen_produced = 0;
-        self.gen_max = max;
+        self.gen.pos = start_pos + toks.len() as i32;
+        self.gen.out.clear();
+        self.gen.produced = 0;
+        self.gen.max = max;
         // Empty interjection (first token is a stop): don't enter the fused loop.
         if self.engine.is_eog(first) || Some(first) == self.eot || Some(first) == self.sot {
             self.session.clear_seq(GEN_SEQ as u32)?;
-            self.gen_in_flight = false;
-            self.pending_gen_tok = None;
+            self.gen.in_flight = false;
+            self.gen.pending = None;
         } else {
-            self.pending_gen_tok = Some(first);
-            self.gen_in_flight = true;
+            self.gen.pending = Some(first);
+            self.gen.in_flight = true;
         }
         Ok(())
     }
@@ -277,7 +315,7 @@ impl Lobe<'_> {
             "interject_begin"
         );
 
-        self.interjection = Some(InterjectState::Prefill {
+        self.gen.fsm = Some(InterjectState::Prefill {
             prompt_len: toks.len(),
             toks,
             start_pos,
@@ -291,7 +329,7 @@ impl Lobe<'_> {
     /// `GEN_SEQ`; each subsequent call greedily decodes one reply token. Returns `Working(partial)`
     /// with the text so far, or `Done(text)` when it stops (turn boundary / EOG / `max`).
     pub fn interject_step(&mut self) -> Result<InterjectStep> {
-        match self.interjection.take() {
+        match self.gen.fsm.take() {
             None => Ok(InterjectStep::Idle),
             Some(InterjectState::Prefill {
                 toks,
@@ -310,7 +348,7 @@ impl Lobe<'_> {
                     latency_us = pre_t.elapsed().as_micros() as u64,
                     "interject_prefill"
                 );
-                self.interjection = Some(InterjectState::Gen {
+                self.gen.fsm = Some(InterjectState::Gen {
                     pos: start_pos + toks.len() as i32,
                     produced: 0,
                     max,
@@ -335,7 +373,7 @@ impl Lobe<'_> {
                     &logits,
                     self.icfg.temp,
                     self.icfg.top_p,
-                    &mut self.rng_state,
+                    &mut self.gen.rng,
                 );
                 // Stop at any turn boundary (is_eog alone misses gemma-4's <turn|>; <|turn> means
                 // the model has begun a new turn) or the cap. Drop the scratch sequence on finish.
@@ -378,7 +416,7 @@ impl Lobe<'_> {
                 out.push_str(&self.detok_gen(tok));
                 let next_logits = self.decode_seq(&[tok], pos, GEN_SEQ)?;
                 let partial = out.clone();
-                self.interjection = Some(InterjectState::Gen {
+                self.gen.fsm = Some(InterjectState::Gen {
                     pos: pos + 1,
                     produced: produced + 1,
                     max,

@@ -122,7 +122,7 @@ pub use rag::Source;
 // (the `StepOutcome` field + the frontends) is re-exported. `InterjectStep` stays inside the module —
 // it only appears in `interject_step`'s signature there, with no external consumer.
 mod interject;
-use interject::{InterjectConfig, InterjectState};
+use interject::{GenState, InterjectConfig};
 pub use interject::InterjectStatus;
 
 // Interjection anti-fixation memory (recent asides + delta span + dedup) lives in its own module —
@@ -208,35 +208,18 @@ pub struct Lobe<'a> {
     /// is never EOG but signals the model has begun a new turn (its reply is over).
     eot: Option<Token>,
     sot: Option<Token>,
-    /// In-flight streaming interjection (pumped by `interject_step`); None when idle.
-    interjection: Option<InterjectState>,
     /// How interjections are produced (mode, experiment arms, sampling, length hint). Pure config;
     /// see `interject::InterjectConfig`.
     icfg: InterjectConfig,
     /// Interjection anti-fixation memory: recent asides (novelty memory) + the delta-since-last-fire
     /// span + the opt-in dedup backstop. Pure state (no session); see `novelty::InterjectionMemory`.
     memory: InterjectionMemory,
+    /// In-flight interjection generation runtime: the timesliced FSM + the fused concurrent cursors
+    /// (CONCURRENT_FORWARD_PASS.md, TUI path) + the sampler RNG. See `interject::GenState`.
+    gen: GenState,
     /// Structured-observability detail level (`--debug-log`). Inert unless a tracing subscriber is
     /// installed (the `enabled!` guards skip all dump work otherwise).
     debug: crate::trace::DebugCfg,
-    /// xorshift64 state for interjection sampling; constant-seeded so a run is reproducible.
-    rng_state: u64,
-
-    // --- Fused concurrent forward pass (CONCURRENT_FORWARD_PASS.md, TUI path only) ---
-    // When an interjection is in flight, `step()` co-batches the next GEN_SEQ token with the stream
-    // token into ONE decode, so observation (seq 0) never stalls while the lobe generates. These
-    // cursors advance independently of seq-0's `pos`. (Headless still uses the blocking `interject`.)
-    /// Is an interjection generating on GEN_SEQ right now (fused mode)?
-    gen_in_flight: bool,
-    /// GEN_SEQ's position cursor, independent of seq-0's `pos`.
-    gen_pos: i32,
-    /// The GEN_SEQ token to decode next tick (sampled from last tick's gen logits).
-    pending_gen_tok: Option<Token>,
-    /// Accumulated interjection text so far (fused mode).
-    gen_out: String,
-    /// Interjection tokens produced so far, and the cap.
-    gen_produced: usize,
-    gen_max: usize,
 }
 
 /// The outcome of `Lobe::fire_decision` — whether the token fired, plus the gate states for the
@@ -278,17 +261,10 @@ impl<'a> Lobe<'a> {
             window: StreamWindow::default(),
             eot,
             sot,
-            interjection: None,
             icfg: InterjectConfig::default(),
             memory: InterjectionMemory::default(),
+            gen: GenState::default(),
             debug: crate::trace::DebugCfg::default(),
-            rng_state: 0x9E3779B97F4A7C15, // fixed seed → reproducible runs (overridden via set_seed)
-            gen_in_flight: false,
-            gen_pos: 0,
-            pending_gen_tok: None,
-            gen_out: String::new(),
-            gen_produced: 0,
-            gen_max: 0,
         })
     }
 
@@ -313,7 +289,7 @@ impl<'a> Lobe<'a> {
     /// and decorrelated; both guard the xorshift64* `0` fixed point.
     pub fn set_seed(&mut self, seed: u64) {
         let s = if seed == 0 { 0x9E3779B97F4A7C15 } else { seed };
-        self.rng_state = s;
+        self.gen.rng = s;
         let mut z = s.wrapping_add(0x9E3779B97F4A7C15);
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
@@ -467,12 +443,12 @@ impl<'a> Lobe<'a> {
     /// scratch sequence and clear the generation state. Observation (seq 0) is untouched.
     pub fn abort_interjection(&mut self) -> Result<()> {
         self.session.clear_seq(GEN_SEQ as u32)?;
-        self.interjection = None; // timesliced state machine (headless)
+        self.gen.fsm = None; // timesliced state machine (headless)
         // fused state (TUI)
-        self.gen_in_flight = false;
-        self.pending_gen_tok = None;
-        self.gen_out.clear();
-        self.gen_produced = 0;
+        self.gen.in_flight = false;
+        self.gen.pending = None;
+        self.gen.out.clear();
+        self.gen.produced = 0;
         Ok(())
     }
 
@@ -811,7 +787,7 @@ impl<'a> Lobe<'a> {
         //    interjection: both seq 0 and GEN_SEQ add cells each tick (~2×interject_max + the ask),
         //    and a fire can land just under the threshold — so reserve for the whole interjection.
         self.icfg.max_hint = interject_max; // keep the roll margin sized to the actual cap
-        if self.window.evict == EvictMode::Reset && !self.gen_in_flight {
+        if self.window.evict == EvictMode::Reset && !self.gen.in_flight {
             let margin = self.roll_margin();
             if self.pos >= self.n_ctx - margin {
                 self.roll()?;
@@ -861,13 +837,14 @@ impl<'a> Lobe<'a> {
             seq: 0,
             logits: true,
         }];
-        let gen_idx = if self.gen_in_flight {
+        let gen_idx = if self.gen.in_flight {
             let t = self
-                .pending_gen_tok
+                .gen
+                .pending
                 .expect("gen_in_flight implies a pending token");
             batch.push(Decode {
                 token: t,
-                pos: self.gen_pos,
+                pos: self.gen.pos,
                 seq: GEN_SEQ as u32,
                 logits: true,
             });
@@ -884,32 +861,32 @@ impl<'a> Lobe<'a> {
         // 3b. Generation: the token we just decoded (pending) is committed → emit it; sample the next.
         let mut interjection = InterjectStatus::Idle;
         if let Some(gi) = gen_idx {
-            let just = self.pending_gen_tok.take().expect("gen_idx implies pending");
-            self.gen_out.push_str(&self.detok_gen(just));
-            self.gen_produced += 1;
-            self.gen_pos += 1;
+            let just = self.gen.pending.take().expect("gen_idx implies pending");
+            self.gen.out.push_str(&self.detok_gen(just));
+            self.gen.produced += 1;
+            self.gen.pos += 1;
             let gen_logits: Vec<f32> = self.session.logits(gi).to_vec();
             let next = sample_topp(
                 &gen_logits,
                 self.icfg.temp,
                 self.icfg.top_p,
-                &mut self.rng_state,
+                &mut self.gen.rng,
             );
             // Soft length cap: past `gen_max` (interject_max), stop at the next sentence boundary so
             // the aside never ends mid-clause; a hard ceiling (+SLACK) guards against runaway.
             let stop = self.engine.is_eog(next)
                 || Some(next) == self.eot
                 || Some(next) == self.sot
-                || self.gen_produced >= self.gen_max + INTERJECT_SENTENCE_SLACK
-                || (self.gen_produced >= self.gen_max && ends_sentence(&self.gen_out));
+                || self.gen.produced >= self.gen.max + INTERJECT_SENTENCE_SLACK
+                || (self.gen.produced >= self.gen.max && ends_sentence(&self.gen.out));
             if stop {
                 self.session.clear_seq(GEN_SEQ as u32)?;
-                self.gen_in_flight = false;
-                self.gen_produced = 0;
-                interjection = InterjectStatus::Done(std::mem::take(&mut self.gen_out));
+                self.gen.in_flight = false;
+                self.gen.produced = 0;
+                interjection = InterjectStatus::Done(std::mem::take(&mut self.gen.out));
             } else {
-                self.pending_gen_tok = Some(next);
-                interjection = InterjectStatus::Working(self.gen_out.clone());
+                self.gen.pending = Some(next);
+                interjection = InterjectStatus::Working(self.gen.out.clone());
             }
         }
 
@@ -925,7 +902,7 @@ impl<'a> Lobe<'a> {
         // Deferring a start on a Done tick avoids clobbering the finished text in the status enum.
         if fired && matches!(interjection, InterjectStatus::Idle) {
             self.start_fused_interjection(interject_max)?;
-            if self.gen_in_flight {
+            if self.gen.in_flight {
                 interjection = InterjectStatus::Started;
             }
         }
@@ -1042,7 +1019,7 @@ impl<'a> Lobe<'a> {
         (
             self.session.seq_pos_max(0),
             self.session.seq_pos_max(GEN_SEQ as u32),
-            self.gen_in_flight,
+            self.gen.in_flight,
         )
     }
 }
