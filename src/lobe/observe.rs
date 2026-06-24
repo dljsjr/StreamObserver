@@ -9,6 +9,15 @@ use super::*;
 use crate::backend::Backend;
 use anyhow::Result;
 
+/// Which GEN_SEQ lane(s) (if any) rode along in this tick's fused decode, so `step` can route the
+/// per-lane logits: nothing, a single reply lane, or a chunk of `k` prefill lanes (`last_chunk` marks
+/// the chunk that carries the final ask token's logits → seeds the first reply). See `Lobe::step`.
+enum GenKind {
+    None,
+    Gen,
+    Prefill { k: usize, last_chunk: bool },
+}
+
 /// The outcome of `Lobe::fire_decision` — whether the token fired, plus the gate states for the
 /// observe trace (`suppressed_settle` / `in_refractory` / `gate_pass`).
 struct FireOutcome {
@@ -304,24 +313,55 @@ impl<B: Backend> Lobe<'_, B> {
         let logit_dump = trig_on
             .then(|| self.logits_debug(&self.last_logits, self.debug.topk).to_string());
 
-        // 3. FUSED decode (the imperative shell, `fused::decode_lanes`): the stream lane (seq 0) and,
-        //    if an interjection is in flight, the generation lane (GEN_SEQ) ride in ONE decode. The
-        //    lanes are the injected "token sources"; the per-lane logits come back for interpretation.
-        let mut lanes = vec![fused::Lane { token: stream_tok, pos: self.pos, seq: 0 }];
-        if self.gen.in_flight {
-            let pending = self.gen.pending.expect("gen_in_flight implies a pending token");
-            lanes.push(fused::Lane { token: pending, pos: self.gen.pos, seq: GEN_SEQ as u32 });
-        }
+        // 3. FUSED decode (the imperative shell, `fused::decode_lanes`): the stream lane (seq 0) always
+        //    rides; an in-flight interjection adds — in ONE decode — either its single reply lane (gen)
+        //    OR a CHUNK of ask lanes (prefill), both on GEN_SEQ. `gen_kind` records which so 3b can
+        //    route the per-lane logits. Chunked prefill is why the stream never stalls at a fire: the
+        //    200–350-token ask is spread PREFILL_CHUNK tokens per tick instead of one blocking decode.
+        let mut lanes = vec![fused::Lane { token: stream_tok, pos: self.pos, seq: 0, logits: true }];
+        let gen_kind = if !self.gen.in_flight {
+            GenKind::None
+        } else if self.gen.prefill.is_empty() {
+            let pending = self
+                .gen
+                .pending
+                .expect("in-flight gen (not prefilling) implies a pending token");
+            lanes.push(fused::Lane { token: pending, pos: self.gen.pos, seq: GEN_SEQ as u32, logits: true });
+            GenKind::Gen
+        } else {
+            // Prefill chunk: up to PREFILL_CHUNK ask tokens at consecutive GEN_SEQ positions. Only the
+            // FINAL ask token requests logits (to seed the first reply); the rest just build KV.
+            let chunk = self.icfg.prefill_chunk;
+            let remaining = self.gen.prefill.len() - self.gen.prefill_cursor;
+            let k = remaining.min(chunk);
+            let last_chunk = remaining <= chunk;
+            for j in 0..k {
+                let tok = self.gen.prefill[self.gen.prefill_cursor + j];
+                let is_final_ask = last_chunk && j + 1 == k;
+                lanes.push(fused::Lane {
+                    token: tok,
+                    pos: self.gen.pos + j as i32,
+                    seq: GEN_SEQ as u32,
+                    logits: is_final_ask,
+                });
+            }
+            GenKind::Prefill { k, last_chunk }
+        };
         let logits = fused::decode_lanes(&mut self.session, &lanes)?;
 
         // 3a. Observation: lane 0's distribution becomes next tick's `last_logits`.
         self.last_logits.clear();
         self.last_logits.extend_from_slice(&logits[0]);
 
-        // 3b. Generation: if a gen lane rode along, advance it from its lane's logits (interject.rs).
-        let mut interjection = match logits.get(1) {
-            Some(gen_logits) => self.advance_fused_gen(gen_logits)?,
-            None => InterjectStatus::Idle,
+        // 3b. Generation: advance the interjection from its lane(s) (interject.rs).
+        let mut interjection = match gen_kind {
+            GenKind::None => InterjectStatus::Idle,
+            GenKind::Gen => self.advance_fused_gen(&logits[1])?,
+            // The final ask token is the last gen lane → logits index `k` (lane 0 is the stream).
+            GenKind::Prefill { k, last_chunk } => {
+                let final_logits = if last_chunk { logits[k].as_slice() } else { &[][..] };
+                self.advance_fused_prefill(k, last_chunk, final_logits)?
+            }
         };
 
         // 4. Advance seq 0 (mirrors decode_one's pos++ and observe's recent_id push).
@@ -462,6 +502,49 @@ mod tests {
         }
         assert!(lobe.resets() >= 1); // it rolled at least once
         assert!(lobe.position() < 512); // pos sawtooths below n_ctx, never overruns
+        Ok(())
+    }
+
+    // CHUNKED PREFILL invariance: spreading the interjection ask across ticks (small `prefill_chunk`)
+    // vs prefilling it in one shot (huge `prefill_chunk`) must leave BOTH the observation stream and
+    // the interjection OUTPUT byte-identical. On the mock the decode is deterministic (no GPU FP noise),
+    // so this is an exact equality — the strongest form of the "chunking only spreads latency" claim.
+    #[test]
+    fn chunked_prefill_changes_neither_observation_nor_interjection() -> Result<()> {
+        fn run(chunk: usize) -> Result<(Vec<f32>, Vec<String>)> {
+            let backend = MockBackend { n_vocab: 8 };
+            let cfg = LobeConfig {
+                prefill_chunk: chunk,
+                interject_max: 4, // small so the run completes quickly (mock has no EOG/sentence stop)
+                refractory: 0,
+                ..LobeConfig::default()
+            };
+            let mut lobe = Lobe::new(&backend, 4096, cfg)?;
+            let preamble = lobe.tokenize("sink", true)?;
+            lobe.prime(&preamble)?;
+            let mut stats = Welford::new(2, 0);
+            let mut retrieve = |_: &str| None::<String>; // --rag off
+            let mut surprisals = Vec::new();
+            let mut asides = Vec::new();
+            let (mut pending, mut revealed) = (None, false);
+            // Warm with low-id tokens, spike once with id 7 (fires → interjection), then idle long
+            // enough for the whole ask (chunked at `chunk`/tick) + the capped generation to complete.
+            let mut ids = vec![0u8, 1, 0, 1, 0, 7];
+            ids.extend(std::iter::repeat(0).take(600));
+            for &id in &ids {
+                let out = lobe.step(Token(id as i32), &mut stats, 3.0, 5, 4, &mut retrieve)?;
+                surprisals.push(out.step.surprisal);
+                if let Some(text) = lobe.advance_reveal(Some(out.interjection), &mut pending, &mut revealed)? {
+                    asides.push(text);
+                }
+            }
+            Ok((surprisals, asides))
+        }
+        let (s_chunked, a_chunked) = run(4)?; // spread: 4 ask tokens per tick
+        let (s_oneshot, a_oneshot) = run(100_000)?; // the whole ask in one tick (old behavior)
+        assert_eq!(s_chunked, s_oneshot, "observation must not depend on prefill chunking");
+        assert_eq!(a_chunked, a_oneshot, "interjection output must not depend on prefill chunking");
+        assert!(!a_chunked.is_empty(), "the spike should have produced a completed interjection");
         Ok(())
     }
 }

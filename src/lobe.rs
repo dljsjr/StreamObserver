@@ -188,6 +188,7 @@ impl<'a, B: Backend> Lobe<'a, B> {
             temp: cfg.interject_temp,
             top_p: cfg.interject_top_p,
             max_hint: cfg.interject_max,
+            prefill_chunk: cfg.prefill_chunk.max(1), // ≥1, else prefill never advances
         };
         let mut window = StreamWindow::default();
         window.set_eviction(cfg.evict, cfg.keep_recent);

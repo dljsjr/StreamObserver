@@ -10,19 +10,21 @@
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode};
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap};
 use ratatui::Frame;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
-use tachyonfx::{fx, Duration as FxDuration, Effect, EffectRenderer, ToRgbComponents};
+use tachyonfx::ToRgbComponents;
 
-use crate::lobe::Lobe;
+use crate::present_worker::{Control, Display, UiEvent};
 use crate::sprite::{Anim, Sprite};
-use crate::stats::Welford;
-use crate::Cli;
 
-const PROSE_TAIL_CHARS: usize = 12_000; // bound display memory (the lobe keeps its own context)
+/// ~30fps render cadence — independent of the token pace (the worker owns that). Keeps the fire/glow
+/// animation and input smooth regardless of `--tick-ms`.
+const FRAME_MS: u64 = 33;
 
 /// The study scene art (sprite-grid JSON), embedded at compile time. 100 px wide × 48 px tall =
 /// 100 cells wide × 24 cell-rows tall. FIXED size — never scaled; anchored bottom-center.
@@ -53,124 +55,73 @@ const VIG_MAX_DIM: f32 = 0.55; // vignette: max brightness cut at the darkest ed
 /// (Werner stands reading in front of his chair; his head is centered at col 64 of the 100-wide room.)
 const HEAD_COL: u16 = 64;
 
-pub fn run(
-    lobe: &mut Lobe,
-    cli: &Cli,
-    input_path: &str,
-    tick_ms: u64,
-    skip_to: &str,
-    retrieve: &mut crate::retrieval::RetrieveFn<'_>,
+/// Render-only loop for the scene skin: consume the worker's display events and animate the study.
+/// ALL llama work lives on the worker thread (`present_worker`), so the fire/glow NEVER freeze on a
+/// retrieval or interjection — that's the hiccup fix. Controls match plain `present`: `space` pauses
+/// the stream, `q` quits, `+`/`-` nudge the threshold silently.
+pub fn render(
+    title: &str,
+    ui_rx: &Receiver<UiEvent>,
+    ctrl_tx: &Sender<Control>,
 ) -> Result<()> {
     // Parse the scene + flame animation once, up front, so a malformed asset fails loudly before
     // entering raw mode.
     let scene = Sprite::from_json(STUDY_JSON)?;
     let fire = Anim::from_json(FIRE_JSON)?;
 
-    let interject = cli.interject_on();
-    let interject_max = cli.interject_max;
-    let mut raw = std::fs::read_to_string(input_path)?;
-    if !skip_to.is_empty() {
-        if let Some(idx) = raw.find(skip_to) {
-            raw = raw[idx..].to_string();
-        }
-    }
-    let tokens = lobe.tokenize(&raw, false)?;
-    let mut feed = tokens.into_iter();
+    let mut display = Display::default();
+    let mut paused = false; // local mirror for the footer; the worker is the source of truth
 
-    let mut stats = Welford::new(cli.warmup, cli.adapt);
-    let mut z = cli.z; // pre-tuned; +/- still adjusts silently
-    let title = std::path::Path::new(input_path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("stream")
-        .to_string();
-
-    // Display state — same shape as present.rs.
-    let mut prose = String::new();
-    let mut last_aside: Option<String> = None;
-    let mut pending: Option<String> = None;
-    let mut revealed = false;
-    let mut paused = false;
-    let mut done = false;
-    let mut last_tick = Instant::now();
-    let tick = Duration::from_millis(tick_ms);
-
-    // Fireplace animation state: the flame loops at its own fps independent of the stream tick, and
-    // the glow shader is a continuous tachyonfx effect advanced by per-frame wall-clock delta. Both
-    // keep crackling even while paused — a fire doesn't stop when you stop reading.
+    // Fireplace animation state: the flame loops at its own fps independent of the stream, and the
+    // glow is a per-frame pass driven by wall-clock time (`anim_start`). Both keep crackling even
+    // while paused (or while the worker is mid-interjection) — a fire doesn't stop.
     let mut fire_idx = 0usize;
     let mut last_fire = Instant::now();
     let fire_period = Duration::from_secs_f32(1.0 / fire.fps.max(1.0));
-    let mut glow = make_glow();
-    let mut last_draw = Instant::now();
+    let frame = Duration::from_millis(FRAME_MS);
+    let mut last = Instant::now();
+    let anim_start = Instant::now(); // drives the glow flicker AND the "musing…" ellipsis
 
     let mut terminal = ratatui::init();
     let res = (|| -> Result<()> {
         loop {
+            // Pull whatever the worker produced; exit if it vanished before the stream finished.
+            if !display.drain(ui_rx) && !display.done {
+                break;
+            }
+
             if last_fire.elapsed() >= fire_period {
                 fire_idx = (fire_idx + 1) % fire.frames.len();
                 last_fire = Instant::now();
             }
-            let glow_dt: FxDuration = last_draw.elapsed().into();
-            last_draw = Instant::now();
             let flame = &fire.frames[fire_idx];
+            let last_aside = display.asides.last().map(|s| s.as_str());
+            let anim_ms = anim_start.elapsed().as_millis() as u64;
             terminal.draw(|f| {
-                draw(f, &scene, flame, &mut glow, glow_dt, &title, &prose,
-                     last_aside.as_deref(), pending.as_deref(), paused, done)
+                draw(f, &scene, flame, title, &display.prose,
+                     last_aside, display.pending.as_deref(), paused, display.done, anim_ms)
             })?;
 
-            let timeout = tick
-                .checked_sub(last_tick.elapsed())
-                .unwrap_or_else(|| Duration::from_millis(0));
+            let timeout = frame.checked_sub(last.elapsed()).unwrap_or_default();
             if event::poll(timeout)? {
                 if let Event::Key(k) = event::read()? {
                     match k.code {
                         KeyCode::Char('q') | KeyCode::Esc => break,
-                        KeyCode::Char(' ') => paused = !paused,
-                        KeyCode::Char('+') | KeyCode::Char('=') => z = (z + 0.25).min(12.0),
-                        KeyCode::Char('-') | KeyCode::Char('_') => z = (z - 0.25).max(0.0),
+                        KeyCode::Char(' ') => {
+                            paused = !paused;
+                            let _ = ctrl_tx.send(Control::Pause(paused));
+                        }
+                        KeyCode::Char('+') | KeyCode::Char('=') => {
+                            let _ = ctrl_tx.send(Control::AdjustZ(0.25));
+                        }
+                        KeyCode::Char('-') | KeyCode::Char('_') => {
+                            let _ = ctrl_tx.send(Control::AdjustZ(-0.25));
+                        }
                         _ => {}
                     }
                 }
             }
-
-            if last_tick.elapsed() < tick {
-                continue;
-            }
-            last_tick = Instant::now();
-            if paused || done {
-                continue;
-            }
-
-            // One fused step per tick — COPIED from present.rs (identical pending/revealed/dedup logic);
-            // only the display differs.
-            if let Some(tok) = feed.next() {
-                // One fused step per tick: observe + advance any in-flight aside in one decode. With
-                // --rag, step() retrieves on a fire and weaves the recall into the aside IN VOICE
-                // (the aside still streams concurrently; only the query embed + ask-prefill stall).
-                let (s, status) = if interject {
-                    let out = lobe.step(tok, &mut stats, z, cli.topk, interject_max, retrieve)?;
-                    (out.step, Some(out.interjection))
-                } else {
-                    (lobe.observe(tok, &mut stats, z, cli.topk)?, None)
-                };
-
-                prose.push_str(&s.token_text);
-                if prose.len() > PROSE_TAIL_CHARS {
-                    let want = prose.len() - PROSE_TAIL_CHARS;
-                    let cut = (want..prose.len())
-                        .find(|&i| prose.is_char_boundary(i))
-                        .unwrap_or(prose.len());
-                    prose.drain(0..cut);
-                }
-
-                // The dedup/reveal policy lives in the lobe; we just store whatever survives.
-                if let Some(text) = lobe.advance_reveal(status, &mut pending, &mut revealed)? {
-                    last_aside = Some(text);
-                }
-            } else {
-                done = true;
-            }
+            last = Instant::now();
         }
         Ok(())
     })();
@@ -186,18 +137,18 @@ fn draw(
     f: &mut Frame,
     scene: &Sprite,
     flame: &Sprite,
-    glow: &mut Effect,
-    glow_dt: FxDuration,
     title: &str,
     prose: &str,
     last_aside: Option<&str>,
     pending: Option<&str>,
     paused: bool,
     done: bool,
+    anim_ms: u64,
 ) {
     // Paint the whole frame the room's deep-shadow tone so transparent sprite cells + margins read as
-    // one continuous dark study, not the terminal default.
-    let backdrop = Block::default().style(Style::default().bg(Color::Rgb(28, 22, 21)));
+    // one continuous dark study, not the terminal default. The glow pass (in draw_stage) then lights
+    // the WHOLE stage region from this base, so the room dissolves into the surrounding shadow.
+    let backdrop = Block::default().style(Style::default().bg(Color::Rgb(34, 26, 22)));
     f.render_widget(backdrop, f.area());
 
     let outer = Layout::default()
@@ -210,22 +161,20 @@ fn draw(
         .split(f.area());
 
     crate::present::draw_prose(f, outer[0], title, prose);
-    draw_stage(f, outer[1], scene, flame, glow, glow_dt, last_aside, pending);
+    draw_stage(f, outer[1], scene, flame, last_aside, pending, anim_ms);
     crate::present::draw_footer(f, outer[2], paused, done);
 }
 
 /// The stage: sprite anchored bottom-center; the current aside as a speech bubble in the open band
 /// ABOVE the sprite (never over it), with a short tail pointing down at the gent's head.
-#[allow(clippy::too_many_arguments)]
 fn draw_stage(
     f: &mut Frame,
     area: Rect,
     scene: &Sprite,
     flame: &Sprite,
-    glow: &mut Effect,
-    glow_dt: FxDuration,
     last_aside: Option<&str>,
     pending: Option<&str>,
+    anim_ms: u64,
 ) {
     let (sw, sh) = scene.cell_size();
     let sprite_w = sw.min(area.width);
@@ -248,10 +197,15 @@ fn draw_stage(
     };
     f.render_widget(flame, flame_rect);
 
-    // Fireplace glow: a continuous tachyonfx shader pulsing warm light over the scene, falling off
-    // with distance from the fire. Applied AFTER the scene + flame are drawn (it modulates the
-    // already-painted cells), and scoped to the scene rect so it never touches the bubble/prose.
-    f.render_effect(glow, sprite_rect, glow_dt);
+    // Fireplace glow: warm + brighten near the hearth, vignette to shadow at the edges, with an
+    // organic flicker. Applied AFTER the scene + flame are drawn (it modulates the already-painted
+    // cells) and over the WHOLE stage `area` — NOT just the sprite rect — so the room's walls dissolve
+    // into the surrounding shadow as one continuous firelit field, instead of reading as a lit
+    // rectangle floating on a flat backdrop. The fire center is the flame in absolute buffer cells.
+    let t = anim_ms as f32 / 1000.0;
+    let fcx = sprite_rect.x as f32 + GLOW_PX_X;
+    let fcy = sprite_rect.y as f32 + GLOW_PX_Y / 2.0;
+    apply_glow(f.buffer_mut(), area, fcx, fcy, t);
 
     // The bubble lives in the band ABOVE the sprite (never over it).
     let band = Rect {
@@ -260,19 +214,35 @@ fn draw_stage(
         width: area.width,
         height: sprite_y.saturating_sub(area.y),
     };
-    draw_bubble(f, band, sprite_rect, last_aside, pending);
+    draw_bubble(f, band, sprite_rect, last_aside, pending, anim_ms);
+}
+
+/// The bubble's three visual states: thinking (prefill, before any reply token), actively typing the
+/// reply, and settled. They get deliberately distinct chrome so "musing" never reads as a real aside.
+enum BubbleState {
+    Musing,  // prefilling — dim, italic, animated ellipsis (low contrast: the gent is thinking)
+    Forming, // typing the reply — warm/bold with a caret
+    Settled, // the last completed aside — calm cream
 }
 
 /// A rounded speech bubble in `band` (the open space above the sprite), holding the CURRENT aside —
 /// the in-flight one (warm/bold, with a caret) while generating, else the most recent settled one.
 /// Bottom-anchored just above the sprite, with a short downward tail stub in the gap pointing at the
 /// gent (so the tail never has to draw over the art).
-fn draw_bubble(f: &mut Frame, band: Rect, sprite_rect: Rect, last_aside: Option<&str>, pending: Option<&str>) {
-    let (text, forming): (String, bool) = match pending {
-        Some(p) if !p.is_empty() => (format!("{p}▍"), true),
-        Some(_) => ("musing…".to_string(), true), // buffering the opening (caret-only phase)
+fn draw_bubble(
+    f: &mut Frame,
+    band: Rect,
+    sprite_rect: Rect,
+    last_aside: Option<&str>,
+    pending: Option<&str>,
+    anim_ms: u64,
+) {
+    let (text, state): (String, BubbleState) = match pending {
+        Some(p) if !p.is_empty() => (format!("{p}▍"), BubbleState::Forming),
+        // Prefilling: thinking, not speaking yet — the dim animated placeholder (see musing_label).
+        Some(_) => (crate::present::musing_label(anim_ms), BubbleState::Musing),
         None => match last_aside {
-            Some(a) if !a.is_empty() => (a.to_string(), false),
+            Some(a) if !a.is_empty() => (a.to_string(), BubbleState::Settled),
             _ => return, // nothing to say yet → no bubble (just the quiet scene)
         },
     };
@@ -287,10 +257,23 @@ fn draw_bubble(f: &mut Frame, band: Rect, sprite_rect: Rect, last_aside: Option<
     let by = band.bottom().saturating_sub(bh + 1);
     let bubble = Rect { x: bx, y: by, width: bw, height: bh };
 
-    let (border_color, text_style) = if forming {
-        (Color::Yellow, Style::default().fg(Color::Rgb(255, 244, 214)).add_modifier(Modifier::BOLD))
-    } else {
-        (Color::Rgb(214, 214, 208), Style::default().fg(Color::Rgb(232, 230, 224)))
+    let (border_color, text_style) = match state {
+        // Low contrast: a muted border that recedes into the warm dark + dim italic text — clearly
+        // "thinking", not "speaking". The animated ellipsis (in `text`) carries the liveness.
+        BubbleState::Musing => (
+            Color::Rgb(92, 80, 74),
+            Style::default()
+                .fg(Color::Rgb(150, 138, 130))
+                .add_modifier(Modifier::ITALIC | Modifier::DIM),
+        ),
+        BubbleState::Forming => (
+            Color::Yellow,
+            Style::default().fg(Color::Rgb(255, 244, 214)).add_modifier(Modifier::BOLD),
+        ),
+        BubbleState::Settled => (
+            Color::Rgb(214, 214, 208),
+            Style::default().fg(Color::Rgb(232, 230, 224)),
+        ),
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -316,23 +299,20 @@ fn draw_bubble(f: &mut Frame, band: Rect, sprite_rect: Rect, last_aside: Option<
     }
 }
 
-/// Build the continuous fireplace-glow shader. A tachyonfx `effect_fn` that, every frame, warms and
-/// pulses each cell by an amount that falls off with distance from the fire. The flicker is driven by
-/// an `Instant` state (wall-clock continuous, independent of the effect timer), over a timer so long
-/// it never "completes" within a session. The effect's `area` is the scene's render rect, so the fire
-/// center is derived from it each frame → correct after a terminal resize.
-fn make_glow() -> Effect {
-    let start = Instant::now();
-    fx::effect_fn(start, FxDuration::from_millis(u32::MAX), |start, ctx, cells| {
-        let t = start.elapsed().as_secs_f32();
-        let area = ctx.area;
-        let fcx = area.x as f32 + GLOW_PX_X;
-        let fcy = area.y as f32 + GLOW_PX_Y / 2.0; // scene pixel row → cell row
-        // Layered sines → an organic flicker in roughly [-1, 1]: a fast crackle over a slower swell.
-        let flick = 0.50 * (t * 11.0).sin() + 0.30 * (t * 19.0 + 1.3).sin() + 0.20 * (t * 6.1 + 2.1).sin();
-        for (pos, cell) in cells {
-            let dx = pos.x as f32 - fcx;
-            let dy = (pos.y as f32 - fcy) * 2.0; // cells are ~2× tall → keep the falloff circular
+/// The fireplace glow: every frame, warm + pulse each cell in `area` by an amount that falls off with
+/// distance from the fire, vignetting to shadow at the edges. A direct per-frame pass (not a tachyonfx
+/// effect) so it can cover the WHOLE stage with the fire center at an ABSOLUTE buffer position (`fcx`,
+/// `fcy`) — the effect-relative center couldn't, which is why the glow used to be confined to the
+/// sprite rect (→ the room read as a lit rectangle on a flat backdrop). `t` is wall-clock seconds,
+/// driving the flicker; the falloff/warmth math is unchanged.
+fn apply_glow(buf: &mut Buffer, area: Rect, fcx: f32, fcy: f32, t: f32) {
+    // Layered sines → an organic flicker in roughly [-1, 1]: a fast crackle over a slower swell.
+    let flick = 0.50 * (t * 11.0).sin() + 0.30 * (t * 19.0 + 1.3).sin() + 0.20 * (t * 6.1 + 2.1).sin();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let Some(cell) = buf.cell_mut((x, y)) else { continue };
+            let dx = x as f32 - fcx;
+            let dy = (y as f32 - fcy) * 2.0; // cells are ~2× tall → keep the falloff circular
             let dist = (dx * dx + dy * dy).sqrt();
             // Near-fire GLOW: brighten + warm + flicker, hugging the hearth (eased reach GLOW_R).
             let near = (1.0 - dist / GLOW_R).clamp(0.0, 1.0);
@@ -345,7 +325,7 @@ fn make_glow() -> Effect {
             cell.set_fg(warm(cell.fg.to_rgb(), bright, warmth));
             cell.set_bg(warm(cell.bg.to_rgb(), bright, warmth));
         }
-    })
+    }
 }
 
 /// Re-light one color: scale brightness by `bright` (the glow pulse × vignette dimming), then nudge
@@ -361,11 +341,12 @@ fn warm((r, g, b): (u8, u8, u8), bright: f32, warmth: f32) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::buffer::{Buffer, Cell};
+    use ratatui::buffer::Cell;
 
-    /// End-to-end check of the tachyonfx glow wiring (the part no TTY can show offline): build the
-    /// effect, process one frame over a flat buffer, and confirm it (a) modulates cells AT the hearth
-    /// and (b) DARKENS the far corners (the vignette). Guards against the effect silently no-op'ing.
+    /// The glow pass (the part no TTY can show offline): run one frame over a flat buffer with the fire
+    /// center at the hearth, and confirm it (a) modulates cells AT the hearth and (b) DARKENS the far
+    /// corners (the vignette). Guards against the pass silently no-op'ing — and, since it now covers the
+    /// whole stage, that the absolute-center math lights the right spot regardless of the area origin.
     #[test]
     fn glow_lights_the_hearth_and_vignettes_the_corners() {
         let area = Rect::new(0, 0, 100, 24);
@@ -374,11 +355,11 @@ mod tests {
         seed.set_fg(base).set_bg(base);
         let mut buf = Buffer::filled(area, seed);
 
-        let mut glow = make_glow();
-        buf.render_effect(&mut glow, area, FxDuration::from_millis(16));
+        // Fire center at the hearth: scene-pixel (50,33) → cell (50,16) in absolute buffer coords.
+        let (fcx, fcy) = (GLOW_PX_X, GLOW_PX_Y / 2.0);
+        apply_glow(&mut buf, area, fcx, fcy, 0.0);
 
-        // The fire center is scene-pixel (50,33) → cell (50,16); that cell must be modulated.
-        let near = buf[(GLOW_PX_X as u16, (GLOW_PX_Y / 2.0) as u16)].clone();
+        let near = buf[(fcx as u16, fcy as u16)].clone();
         assert_ne!(near.bg, base, "glow must modulate cells at the hearth");
         // A far corner is well beyond VIG_R0 → the vignette must dim it (darker than the base gray).
         let far = buf[(99, 0)].clone();

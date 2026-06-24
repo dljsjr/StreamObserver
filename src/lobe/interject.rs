@@ -79,6 +79,9 @@ pub(crate) struct InterjectConfig {
     /// Max interjection length (tokens), used to size the cap+reset roll margin so an interjection's
     /// full concurrent KV footprint (ask + generated tokens + seq-0 growth during gen) always fits.
     pub max_hint: usize,
+    /// Ask tokens prefilled per tick (CHUNKED PREFILL; ≥1) — the per-tick decode weight vs. aside-start
+    /// latency knob. See `LobeConfig::prefill_chunk`.
+    pub prefill_chunk: usize,
 }
 
 impl Default for InterjectConfig {
@@ -90,6 +93,7 @@ impl Default for InterjectConfig {
             temp: 0.7,                    // the fixation fix (see Lobe::set_interject_sampling)
             top_p: 0.95,
             max_hint: 96,
+            prefill_chunk: 8,
         }
     }
 }
@@ -103,7 +107,15 @@ pub(crate) struct GenState {
     // --- Fused concurrent forward pass (CONCURRENT_FORWARD_PASS.md, TUI path) ---
     /// Is an interjection generating on GEN_SEQ right now (fused mode)?
     pub in_flight: bool,
-    /// GEN_SEQ's position cursor, independent of seq-0's `pos`.
+    /// The ask tokens still to be prefilled onto GEN_SEQ. CHUNKED PREFILL: rather than decode the
+    /// whole (often 200–350-token) ask in one blocking shot at the fire — which froze the stream for
+    /// ~250–500ms — the ask is co-batched a chunk at a time with the stream token across ticks, so the
+    /// prose keeps scrolling and the aside just starts a few ticks later. Non-empty ⟺ still prefilling;
+    /// emptied (→ first reply sampled) when the last chunk lands. `prefill_cursor` is the next index.
+    pub prefill: Vec<Token>,
+    pub prefill_cursor: usize,
+    /// GEN_SEQ's position cursor, independent of seq-0's `pos`. During prefill it tracks the next ask
+    /// position; once prefilling is done it's where the first/next reply token goes.
     pub pos: i32,
     /// The GEN_SEQ token to decode next tick (sampled from last tick's gen logits).
     pub pending: Option<Token>,
@@ -122,6 +134,8 @@ impl Default for GenState {
         Self {
             fsm: None,
             in_flight: false,
+            prefill: Vec::new(),
+            prefill_cursor: 0,
             pos: 0,
             pending: None,
             out: String::new(),
@@ -212,10 +226,12 @@ impl<B: Backend> Lobe<'_, B> {
         Ok(None)
     }
 
-    /// Fork seq 0 onto GEN_SEQ and prefill the interjection ask in ONE decode (the single
-    /// per-interjection stall), then seed the fused gen cursors. Subsequent reply tokens co-batch in
-    /// `step()`. Mirrors `interject_begin` but drives the fused `gen_*` state instead of the
-    /// timesliced `InterjectState`.
+    /// Fork seq 0 onto GEN_SEQ (cheap shared-cell copy) and STAGE the interjection ask for chunked
+    /// prefill — no big blocking decode here. `step()` then co-batches the ask a chunk at a time with
+    /// the stream token (`advance_fused_prefill`), and subsequent reply tokens co-batch one per tick
+    /// (`advance_fused_gen`). Mirrors `interject_begin` but drives the fused `gen.*` state instead of
+    /// the timesliced `InterjectState`. (The fire tick's only remaining cost is the optional retrieval
+    /// + the cheap fork + tokenizing the ask; the heavy prefill is spread across the next few ticks.)
     pub(crate) fn start_fused_interjection(
         &mut self,
         max: usize,
@@ -237,12 +253,14 @@ impl<B: Backend> Lobe<'_, B> {
                 let ask = self.interject_ask_context(recalled);
                 let mut toks = self.tokenize(&ask, false)?;
                 // Footprint above the fork = ask (GEN_SEQ) + gen tokens (GEN_SEQ) + seq-0's growth
-                // during the deferred-roll generation (BOTH sequences grow concurrently) ≈
-                // ask + 2·(max+SLACK), using the HARD ceiling since the soft cap may overrun by SLACK.
-                // Roll now if that won't fit (no gen in flight while starting).
+                // while BOTH sequences advance concurrently: during the chunked PREFILL (one seq-0
+                // token per ask-chunk tick ≈ ask/PREFILL_CHUNK) AND during generation (≈ max+SLACK).
+                // ≈ ask + 2·(max+SLACK) + ask/PREFILL_CHUNK, using the HARD ceiling since the soft cap
+                // may overrun by SLACK. Roll now if that won't fit (no gen in flight while starting).
                 let gen_ceiling = (max + INTERJECT_SENTENCE_SLACK) as i32;
+                let prefill_ticks = toks.len().div_ceil(self.icfg.prefill_chunk) as i32; // seq-0 growth in prefill
                 if self.window.evict == EvictMode::Reset
-                    && self.pos + toks.len() as i32 + 2 * gen_ceiling + 32 > self.n_ctx
+                    && self.pos + toks.len() as i32 + 2 * gen_ceiling + prefill_ticks + 32 > self.n_ctx
                 {
                     self.roll()?;
                     let ask = self.interject_ask_context(recalled);
@@ -252,27 +270,57 @@ impl<B: Backend> Lobe<'_, B> {
                 (toks, self.pos)
             }
         };
-        let logits = self.decode_seq(&toks, start_pos, GEN_SEQ)?;
-        let first = sample_topp(
-            &logits,
-            self.icfg.temp,
-            self.icfg.top_p,
-            &mut self.gen.rng,
-        );
-        self.gen.pos = start_pos + toks.len() as i32;
+        // Stage the ask for CHUNKED PREFILL rather than decoding it in one blocking shot (which froze
+        // the stream for ~250–500ms — the ask is often 200–350 tokens). The fork is already in place
+        // (KV shared via copy_seq for context mode; a cleared GEN_SEQ for snippet); from here `step()`
+        // co-batches the ask a chunk at a time with the stream token, so the stream keeps scrolling.
+        // The first reply token is sampled when the final chunk lands (`advance_fused_prefill`).
+        if toks.is_empty() {
+            self.gen.in_flight = false; // degenerate (never happens — the ask always has framing)
+            return Ok(());
+        }
+        self.gen.prefill = toks;
+        self.gen.prefill_cursor = 0;
+        self.gen.pos = start_pos;
+        self.gen.pending = None;
         self.gen.out.clear();
         self.gen.produced = 0;
         self.gen.max = max;
-        // Empty interjection (first token is a stop): don't enter the fused loop.
+        self.gen.in_flight = true;
+        Ok(())
+    }
+
+    /// Advance a CHUNKED PREFILL by one tick: `k` ask tokens were co-batched onto GEN_SEQ this tick
+    /// (positions advanced). If more remain, stay in prefill (the bubble shows "musing…"). On the final
+    /// chunk, `final_logits` is the last ask token's distribution → sample the first reply token and
+    /// hand off to the normal per-token gen (or finish immediately if it's an empty interjection). This
+    /// is the only place the prefill→gen transition happens; the interjection OUTPUT is byte-identical
+    /// to a one-shot prefill (same final-token logits, same RNG), it just no longer blocks the stream.
+    pub(crate) fn advance_fused_prefill(
+        &mut self,
+        k: usize,
+        last_chunk: bool,
+        final_logits: &[f32],
+    ) -> Result<InterjectStatus> {
+        self.gen.prefill_cursor += k;
+        self.gen.pos += k as i32;
+        if !last_chunk {
+            return Ok(InterjectStatus::Started); // still prefilling → caret-only "thinking"
+        }
+        // Prefill complete: GEN_SEQ now holds the full ask; `self.gen.pos` is the first reply position.
+        self.gen.prefill = Vec::new();
+        self.gen.prefill_cursor = 0;
+        let first = sample_topp(final_logits, self.icfg.temp, self.icfg.top_p, &mut self.gen.rng);
+        // Empty interjection (first token is a stop): drop it without entering the gen loop.
         if self.engine.is_eog(first) || Some(first) == self.eot || Some(first) == self.sot {
             self.session.clear_seq(GEN_SEQ as u32)?;
             self.gen.in_flight = false;
             self.gen.pending = None;
+            Ok(InterjectStatus::Done(String::new()))
         } else {
-            self.gen.pending = Some(first);
-            self.gen.in_flight = true;
+            self.gen.pending = Some(first); // co-batches next tick as the first reply lane
+            Ok(InterjectStatus::Started)
         }
-        Ok(())
     }
 
     /// SNIPPET mode prompt: a self-contained gemma-4 chat turn carrying only the last

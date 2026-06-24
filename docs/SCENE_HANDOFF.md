@@ -2,8 +2,9 @@
 
 The `present --scene` skin renders the observer as a tiny chibi gent reading by the fire in a cozy
 pixel-art study, with each interjection as a speech bubble. **Done and working**; actively being
-polished. The fireplace is now **alive**: an animated 4-frame flame + a continuous **tachyonfx glow
-shader** pulse warm light over the room. This doc is so a fresh session can keep iterating.
+polished. The fireplace is now **alive**: an animated 4-frame flame + a continuous **firelight glow
+pass** pulse warm light over the room (now across the whole stage, so the room blends into the
+surrounding shadow rather than floating as a lit box). This doc is so a fresh session can keep iterating.
 
 ## What exists (file map)
 
@@ -12,7 +13,8 @@ shader** pulse warm light over the room. This doc is so a fresh session can keep
   MIDDLE region (where plain `present` shows the asides feed) instead stages the scene sprite
   (bottom-centered) + a rounded **speech bubble** ABOVE it (tail points down at `HEAD_COL`). The scene
   art is `include_str!("../assets/scene/study.json")`. **NEW:** it also blits the animated flame
-  (`fire.anim.json`) over the firebox each tick and runs the glow shader (`make_glow`/`warm`).
+  (`fire.anim.json`) over the firebox each tick and runs the glow pass (`apply_glow`/`warm`) over the
+  full stage.
 - **`src/sprite.rs`** — reusable half-block sprite widget: parses `{palette, rows}` JSON, blits into a
   ratatui `Buffer` as `▀` cells (top px → fg, bottom px → bg; `null` = transparent). **NEW:** `Anim`
   loads the skill's `{fps, loop, frames:[grid…]}` format (used for the flame). Has unit tests.
@@ -69,17 +71,21 @@ a rebuild (it reads the JSON directly). But to see art changes in the LIVE TUI y
   at 8 fps — chunky triangular flame, red edges → orange → yellow → white-hot core, ember/log base, with
   per-frame flicker (tip height + lean + core). The flame is kept **short** (raised `tip_row` in
   `FRAMES`) so there's clear dark headroom at the top of the firebox.
-- **Glow shader (tachyonfx 0.21):** `make_glow()` in `present_scene.rs` — a continuous `fx::effect_fn`
-  over the scene rect that, each frame, re-lights every cell by distance from the fire center
-  (scene-pixel (50,33)). Two zones: a NEAR **glow** (brighten + warm + a dramatic layered-sine flicker,
-  reach `GLOW_R`) and a far **vignette** (dim toward the corners so the room recedes into shadow,
-  `VIG_R0`→`VIG_R1`, up to `VIG_MAX_DIM`). Driven by an `Instant` state (wall-clock continuous) over a
-  ~49-day timer so it never completes; runs even while paused. This is ON TOP of the baked static
-  vignette in `study.py`. **Tunables are named consts** at the top of `present_scene.rs`:
+- **Glow pass:** `apply_glow()` in `present_scene.rs` — a direct per-frame pass (was a tachyonfx
+  `fx::effect_fn`; switched to a manual pass so it can take the fire center in ABSOLUTE buffer coords)
+  that re-lights every cell by distance from the fire center (scene-pixel (50,33)). Two zones: a NEAR
+  **glow** (brighten + warm + a dramatic layered-sine flicker, reach `GLOW_R`) and a far **vignette**
+  (dim toward the corners so the room recedes into shadow, `VIG_R0`→`VIG_R1`, up to `VIG_MAX_DIM`).
+  Driven by wall-clock `t` (the same `anim_start` that drives the "musing…" ellipsis); runs even while
+  paused. **Applied over the WHOLE stage region, not just the sprite rect** — so the room's walls
+  dissolve into the surrounding shadow as one continuous firelit field, instead of reading as a lit
+  rectangle floating on a flat backdrop (the old confined-to-sprite glow was the cause of that seam).
+  This is ON TOP of the baked static vignette in `study.py`. **Tunables are named consts** at the top
+  of `present_scene.rs`:
   `GLOW_R 26`, `GLOW_AMP 0.30` (flicker drama), `VIG_R0 20`, `VIG_R1 58`, `VIG_MAX_DIM 0.55` (edge
-  darkness); the three sine freqs/weights are in the closure. To preview the lit look offline (no TTY),
-  replicate the `make_glow`/`warm` math per-pixel over the composited scene (the shader's cell-space
-  distance == pixel distance from fire-pixel (50,33)) and render with Pillow — see session history.
+  darkness); the three sine freqs/weights are in `apply_glow`. To preview the lit look offline (no TTY),
+  replicate the `apply_glow`/`warm` math per-pixel over the composited scene (the cell-space distance ==
+  pixel distance from fire-pixel (50,33)) and render with Pillow — see session history.
 - **Room:** wide cozy study — bookshelves both walls, lamp+side table (left), rug, framed pictures,
   warm radial fire-glow vignette (`FX,FY,R1,R2` in study.py; brightens wall/floor near the fire).
 

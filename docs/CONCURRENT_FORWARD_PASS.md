@@ -27,6 +27,18 @@ state, and `start_fused_interjection`. Exposed behind an **experimental, opt-in 
   tiny diffs **compound through the Welford baseline into different borderline fires.** So fused
   observation is valid and gap-free, but reproducibility vs. unfused is float-level, not exact.
   (The timesliced path *was* byte-identical because it used identical single-token batches.)
+- **Chunked ask-prefill (the hiccup fix) co-batches during prefill too.** The interjection ask (often
+  200–350 tokens) used to prefill in ONE `decode_seq` at the fire — a ~250–500ms freeze of the stream
+  (measured: median ~256ms on E2B, ~73ms/chunk × the same total on E4B). Now `start_fused_interjection`
+  only STAGES the ask; `step()` co-batches `prefill_chunk` ask tokens per tick alongside the stream
+  token (`GenKind::Prefill`, `advance_fused_prefill`), so the prose never stalls — the aside just starts
+  a few ticks later (the bubble shows "musing…"). Only the FINAL ask token requests logits (gemma's 262k
+  vocab makes the projection non-free), so `fused::Lane` grew a per-lane `logits: bool`. This is the same
+  FP story as above (now the prefill ticks are co-batched too → the ~1e-3 drift extends to them); the
+  interjection OUTPUT is unchanged (same final-token logits + RNG) — `chunked_prefill_changes_neither_
+  observation_nor_interjection` proves both exactly on the deterministic mock. `--prefill-chunk` (default
+  8) trades scroll-smoothness-during-prefill against aside-start latency; the cap+reset fit-check reserves
+  the extra seq-0 growth (`ask/prefill_chunk` ticks).
 
 **The blocker — context-mode fork overruns the unified KV cache under load:**
 - `--interject-mode context` forks seq 0 onto GEN_SEQ via `copy_kv_cache_seq`. In **timesliced**
@@ -85,9 +97,9 @@ Frontends apply the same early-abort dedup as before (buffer → reveal-if-novel
 ```bash
 M=models/gemma-4-E2B_q4_0-it.gguf
 # works (snippet, no fork):
-cat in.txt | streaming-lobe --model $M --ctx 1024 --interject-mode snippet headless --fused
+cat in.txt | streaming-lobe --model $M --ctx 1024 --interject-mode snippet --mode headless --fused
 # crashes under load (context fork):
-cat in.txt | streaming-lobe --model $M --ctx 1024 --interject-mode context headless --fused
+cat in.txt | streaming-lobe --model $M --ctx 1024 --interject-mode context --mode headless --fused
 # observation float-parity check: diff trigger streams of `--no-interject` vs `--fused`.
 ```
 

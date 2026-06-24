@@ -14,116 +14,72 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap};
 use ratatui::Frame;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
-use crate::lobe::Lobe;
-use crate::stats::Welford;
-use crate::Cli;
+use crate::present_worker::{Control, Display, UiEvent};
 
-const PROSE_TAIL_CHARS: usize = 12_000; // bound display memory (the lobe keeps its own context)
-const MAX_RECENT: usize = 24; // recent asides kept for the stack under the live one
+/// ~30fps render cadence — independent of the token pace (which the worker owns). Keeps the frame
+/// loop responsive so input and (in the scene skin) the fire/glow stay smooth no matter the tick.
+const FRAME_MS: u64 = 33;
 
-pub fn run(
-    lobe: &mut Lobe,
-    cli: &Cli,
-    input_path: &str,
-    tick_ms: u64,
-    skip_to: &str,
-    retrieve: &mut crate::retrieval::RetrieveFn<'_>,
+/// The animated "thinking" placeholder shown while an aside is prefilling (pending is `Some("")` — a
+/// fire has happened but no reply token exists yet; the prefill is spreading across ticks). The
+/// trailing ellipsis cycles 1→3 dots ~every 350ms so it reads as ALIVE and distinct from the typed-out
+/// aside. `anim_ms` is wall-clock-since-render-start, so the animation is smooth regardless of tick.
+/// `pub(crate)` so the scene skin shares the identical label.
+pub(crate) fn musing_label(anim_ms: u64) -> String {
+    let dots = (anim_ms / 350 % 3) as usize + 1; // 1..=3
+    format!("musing{}", ".".repeat(dots))
+}
+
+/// Render-only loop: consume the worker's display events, draw, and forward key controls. ALL llama
+/// work lives on the worker thread (`present_worker`), so this loop never blocks — that's the hiccup
+/// fix. `space` pauses the stream, `q` quits, `+`/`-` nudge the threshold (silently).
+pub fn render(
+    title: &str,
+    ui_rx: &Receiver<UiEvent>,
+    ctrl_tx: &Sender<Control>,
 ) -> Result<()> {
-    let interject = cli.interject_on();
-    let interject_max = cli.interject_max;
-    let mut raw = std::fs::read_to_string(input_path)?;
-    if !skip_to.is_empty() {
-        if let Some(idx) = raw.find(skip_to) {
-            raw = raw[idx..].to_string();
-        }
-    }
-    let tokens = lobe.tokenize(&raw, false)?;
-    let mut feed = tokens.into_iter();
-
-    let mut stats = Welford::new(cli.warmup, cli.adapt);
-    let mut z = cli.z; // pre-tuned; +/- still adjusts silently
-
-    let title = std::path::Path::new(input_path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("stream")
-        .to_string();
-
-    // Display state.
-    let mut prose = String::new(); // rolling tail of the streamed text (teleprompter)
-    let mut asides: Vec<String> = Vec::new(); // completed interjections, oldest→newest
-    let mut pending: Option<String> = None; // the in-flight aside, streamed live
-    let mut revealed = false; // dedup: buffer the opening until novelty is decidable, then reveal
-    let mut paused = false;
-    let mut done = false;
-    let mut last_tick = Instant::now();
-    let tick = Duration::from_millis(tick_ms);
+    let mut display = Display::default();
+    let mut paused = false; // local mirror, for the footer; the worker is the source of truth
+    let frame = Duration::from_millis(FRAME_MS);
+    let mut last = Instant::now();
+    let anim_start = Instant::now(); // drives the "musing…" ellipsis, smooth regardless of tick
 
     let mut terminal = ratatui::init();
     let res = (|| -> Result<()> {
         loop {
+            // Pull whatever the worker has produced; exit if it vanished before the stream finished.
+            if !display.drain(ui_rx) && !display.done {
+                break;
+            }
+            let anim_ms = anim_start.elapsed().as_millis() as u64;
             terminal.draw(|f| {
-                draw(f, &title, &prose, &asides, pending.as_deref(), paused, done)
+                draw(f, title, &display.prose, &display.asides,
+                     display.pending.as_deref(), paused, display.done, anim_ms)
             })?;
 
-            let timeout = tick
-                .checked_sub(last_tick.elapsed())
-                .unwrap_or_else(|| Duration::from_millis(0));
+            let timeout = frame.checked_sub(last.elapsed()).unwrap_or_default();
             if event::poll(timeout)? {
                 if let Event::Key(k) = event::read()? {
                     match k.code {
                         KeyCode::Char('q') | KeyCode::Esc => break,
-                        KeyCode::Char(' ') => paused = !paused,
-                        KeyCode::Char('+') | KeyCode::Char('=') => z = (z + 0.25).min(12.0),
-                        KeyCode::Char('-') | KeyCode::Char('_') => z = (z - 0.25).max(0.0),
+                        KeyCode::Char(' ') => {
+                            paused = !paused;
+                            let _ = ctrl_tx.send(Control::Pause(paused));
+                        }
+                        KeyCode::Char('+') | KeyCode::Char('=') => {
+                            let _ = ctrl_tx.send(Control::AdjustZ(0.25));
+                        }
+                        KeyCode::Char('-') | KeyCode::Char('_') => {
+                            let _ = ctrl_tx.send(Control::AdjustZ(-0.25));
+                        }
                         _ => {}
                     }
                 }
             }
-
-            if last_tick.elapsed() < tick {
-                continue;
-            }
-            last_tick = Instant::now();
-            if paused || done {
-                continue;
-            }
-
-            // One fused step per tick: observe the next stream token AND advance any in-flight aside
-            // in one decode, so the prose keeps scrolling while the reply forms. (Same path the
-            // calibration TUI uses; see tui.rs / CONCURRENT_FORWARD_PASS.md.)
-            if let Some(tok) = feed.next() {
-                // One fused step per tick. With --rag, step() retrieves on a fire and weaves the
-                // recall into the aside IN VOICE (still streamed concurrently; only the query embed +
-                // ask-prefill stall).
-                let (s, status) = if interject {
-                    let out = lobe.step(tok, &mut stats, z, cli.topk, interject_max, retrieve)?;
-                    (out.step, Some(out.interjection))
-                } else {
-                    (lobe.observe(tok, &mut stats, z, cli.topk)?, None)
-                };
-
-                prose.push_str(&s.token_text);
-                if prose.len() > PROSE_TAIL_CHARS {
-                    let want = prose.len() - PROSE_TAIL_CHARS;
-                    let cut = (want..prose.len())
-                        .find(|&i| prose.is_char_boundary(i))
-                        .unwrap_or(prose.len());
-                    prose.drain(0..cut);
-                }
-
-                // The dedup/reveal policy lives in the lobe; we store whatever survives.
-                if let Some(text) = lobe.advance_reveal(status, &mut pending, &mut revealed)? {
-                    asides.push(text);
-                    if asides.len() > MAX_RECENT {
-                        asides.remove(0);
-                    }
-                }
-            } else {
-                done = true;
-            }
+            last = Instant::now();
         }
         Ok(())
     })();
@@ -132,6 +88,7 @@ pub fn run(
     res
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw(
     f: &mut Frame,
     title: &str,
@@ -140,6 +97,7 @@ fn draw(
     pending: Option<&str>,
     paused: bool,
     done: bool,
+    anim_ms: u64,
 ) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -151,7 +109,7 @@ fn draw(
         .split(f.area());
 
     draw_prose(f, outer[0], title, prose);
-    draw_feed(f, outer[1], asides, pending);
+    draw_feed(f, outer[1], asides, pending, anim_ms);
     draw_footer(f, outer[2], paused, done);
 }
 
@@ -186,7 +144,7 @@ pub(crate) fn draw_prose(f: &mut Frame, area: Rect, title: &str, prose: &str) {
 /// OLDEST→NEWEST top→bottom: the in-flight one forms at the very bottom (warm, with a caret) and as
 /// each settles the older ones slide up and off the top. Bottom-anchored (scrolled so the newest is
 /// always at the bottom edge), with ample spacing between items.
-fn draw_feed(f: &mut Frame, area: Rect, asides: &[String], pending: Option<&str>) {
+fn draw_feed(f: &mut Frame, area: Rect, asides: &[String], pending: Option<&str>, anim_ms: u64) {
     // Blank display lines between items — "ample spacing" (tune here).
     const ASIDE_GAP: usize = 2;
 
@@ -231,9 +189,13 @@ fn draw_feed(f: &mut Frame, area: Rect, asides: &[String], pending: Option<&str>
             }
         }
         let (body, style) = if p.is_empty() {
+            // Prefilling: the gent is thinking, not speaking yet — a dim, italic, animated placeholder
+            // (low contrast + a breathing ellipsis), deliberately distinct from the typed-out aside.
             (
-                "musing…".to_string(),
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                musing_label(anim_ms),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC | Modifier::DIM),
             )
         } else {
             // The live aside — warm and bold, forming at the bottom of the feed.

@@ -16,6 +16,7 @@ mod backend;
 mod lobe;
 mod present;
 mod present_scene;
+mod present_worker;
 mod prompt;
 mod retrieval;
 mod sprite;
@@ -24,7 +25,7 @@ mod trace;
 mod tui;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, ValueEnum};
 use std::io::{BufRead, Write};
 use std::time::Instant;
 
@@ -46,13 +47,15 @@ fn entropy_seed() -> u64 {
     h.finish()
 }
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(name = "streaming-lobe", version, about)]
 struct Cli {
     /// Path to a GGUF model (e.g. a small Gemma/Qwen at Q4). The observer should be
-    /// small and fast; this is the "limbic" lobe, not the cortex. Defaults to the gemma-4-E2B QAT
-    /// 4-bit GGUF shipped in `models/` — so a bare `streaming-lobe tui` just works.
-    #[arg(long, default_value = "models/gemma-4-E2B_q4_0-it.gguf")]
+    /// small and fast; this is the "limbic" lobe, not the cortex. Defaults to the gemma-4-E4B QAT
+    /// 4-bit GGUF shipped in `models/` — the showcase model (the persona needs E4B; E2B collapses on
+    /// it) — so a bare `streaming-lobe --input … --skip-to …` runs the full demo. (E2B is also in
+    /// `models/` for the leaner/headless use: `--model models/gemma-4-E2B_q4_0-it.gguf`.)
+    #[arg(long, default_value = "models/gemma-4-E4B_q4_0-it.gguf")]
     model: String,
 
     /// Context window size for the observer. Default 32k (gemma-4 iSWA keeps the KV cost sublinear;
@@ -66,8 +69,9 @@ struct Cli {
     gpu_layers: u32,
 
     /// z-score threshold above which a token "fires" (the observer speaks up).
-    /// Lower = chattier. This is the main calibration knob.
-    #[arg(long, default_value_t = 3.0)]
+    /// Lower = chattier. This is the main calibration knob. Default 4.1 = the showcase cadence (sparse
+    /// close-reading; E4B fires hotter than E2B, so a higher z than E2B's old 3.0).
+    #[arg(long, default_value_t = 4.1)]
     z: f32,
 
     /// Number of warmup tokens before triggers are allowed (lets the baseline settle).
@@ -75,8 +79,9 @@ struct Cli {
     warmup: u64,
 
     /// Refractory period (tokens): after the observer fires, it stays quiet this long so it doesn't
-    /// obsess over the same salient thing while it lingers in the context window. 0 disables.
-    #[arg(long, default_value_t = 64)]
+    /// obsess over the same salient thing while it lingers in the context window. 0 disables. Default
+    /// 320 = the showcase cadence (sparse close-reading).
+    #[arg(long, default_value_t = 320)]
     refractory: usize,
 
     /// Surprisal-baseline adaptation window (tokens). 0 = global all-stream baseline (default).
@@ -115,15 +120,19 @@ struct Cli {
 
     /// Read the system-prompt sink from a file instead of `--preamble` (avoids shell-quoting a
     /// paragraph; lets you keep a persona library, e.g. `personas/herzog.txt`). Trimmed of
-    /// surrounding whitespace. Takes precedence over `--preamble` when both are given.
-    #[arg(long)]
+    /// surrounding whitespace. Takes precedence over `--preamble`. Defaults to the showcase persona
+    /// `personas/herzog_varyform.txt`; point it at another persona file for a different voice, or pass
+    /// `--preamble-file ""` (empty) to drop the persona and fall back to `--preamble` / the built-in
+    /// default prompt.
+    #[arg(long, default_value = "personas/herzog_varyform.txt")]
     preamble_file: Option<String>,
 
     /// Frame the incoming stream as the frontier model's *thinking* (#5): pin a fixed chat
     /// wrapper so the observer scores the stream in the "assistant reasoning" register instead
-    /// of as arbitrary raw text. Prepended to --preamble. Recommended for the real use case.
-    #[arg(long, default_value_t = false)]
-    frame: bool,
+    /// of as arbitrary raw text. ON by default (the showcase config; also implied by context
+    /// interject-mode); `--no-frame` disables it.
+    #[arg(long = "no-frame", default_value_t = false)]
+    no_frame: bool,
 
     /// What an interjection reflects on: `context` (default — fork the observer's FULL live context
     /// so it reacts to the whole reasoning) or `snippet` (re-encode only the recent window and react
@@ -183,8 +192,9 @@ struct Cli {
     /// fixation fix. Greedy (0) deterministically collapses to one dominant phrasing per region and
     /// repeats it verbatim even when shown its own prior output; sampling surfaces the varied
     /// observations latent below the argmax and lets the novelty memory actually take effect
-    /// (measured: verbatim-repeats 7/34→2/34, distinct openings 19/34→31/34). 0 = greedy.
-    #[arg(long, default_value_t = 0.7)]
+    /// (measured: verbatim-repeats 7/34→2/34, distinct openings 19/34→31/34). 0 = greedy. Default 0.6
+    /// = the showcase voice (the templating study's converged setting: low temp owns DEPTH).
+    #[arg(long, default_value_t = 0.6)]
     interject_temp: f32,
 
     /// Top-p (nucleus) cutoff for interjection sampling when --interject-temp > 0.
@@ -201,39 +211,92 @@ struct Cli {
     interject: bool,
 
     /// Max tokens per interjection (the length control — the prompt no longer caps it). Global:
-    /// applies to both `headless` and `tui`.
-    #[arg(long, default_value_t = 96)]
+    /// applies to every mode. Default 80 = the showcase length.
+    #[arg(long, default_value_t = 80)]
     interject_max: usize,
 
-    /// Make the observer NON-deterministic. By default every run is byte-identical: the sampler uses
-    /// a fixed seed, and the surprisal trigger is teacher-forced/greedy (deterministic by construction
-    /// — there's no sampler on the observation path to seed). With this flag the code picks a random
-    /// seed from OS entropy each run AND softens the firing decision (probabilistic sigmoid), so BOTH
-    /// the asides AND which tokens fire vary run-to-run — like a chat API. No argument; no tuning.
-    #[arg(long, default_value_t = false)]
-    non_deterministic: bool,
+    /// Ask tokens prefilled per stream tick when a (fused) interjection starts. The interjection's ask
+    /// is often 200–350 tokens; prefilling it in one decode froze the prose ~250–500ms at every fire.
+    /// It's now spread this many tokens per tick (co-batched with the stream), so the prose keeps
+    /// scrolling. SMALLER = smoother scroll during prefill but the aside starts a few more ticks later;
+    /// LARGER = the aside starts sooner but each tick's decode is heavier (a bigger scroll slowdown).
+    /// Live frontends only (`present`/`tui`); ≥1.
+    #[arg(long, default_value_t = 8)]
+    prefill_chunk: usize,
 
-    /// #8 RAG: on each fire, run the native tool-calling retrieval pass instead of the free-association
-    /// aside — the observer thinks, (maybe) calls `search`, and grounds its reply in the hit. Works in
-    /// every mode (headless emits JSONL; tui/present show the grounded aside). In a live mode the
-    /// retrieval pass blocks the stream briefly (serialized). Headless: mutually exclusive with --fused.
+    /// Make the observer DETERMINISTIC (byte-identical runs). By DEFAULT the showcase is
+    /// NON-deterministic: a random OS-entropy seed each run + a softened (probabilistic-sigmoid) firing
+    /// decision, so BOTH the asides AND which tokens fire vary run-to-run — like a chat API. Pass this
+    /// to pin it: a fixed sampler seed + a hard firing threshold (the surprisal trigger is greedy/
+    /// teacher-forced, so it's deterministic by construction anyway). No argument; no tuning.
     #[arg(long, default_value_t = false)]
-    rag: bool,
+    deterministic: bool,
+
+    /// Disable #8 RAG. RAG is ON by default (the showcase config): on each fire the observer retrieves
+    /// over the corpus and weaves the hit into its aside in voice (live modes), or emits the native
+    /// tool-call JSONL (headless). Pass `--no-rag` for the lean free-association / pure-surprisal path
+    /// (and to skip the embed-model load + corpus index at startup).
+    #[arg(long = "no-rag", default_value_t = false)]
+    no_rag: bool,
 
     /// Corpus text file the `search` tool retrieves over (#8) — the "external knowledge base", e.g. the
-    /// novel being read. Set → retrieval is real (BM25) and hits feed back into a grounded aside; unset
-    /// → retrieval finds nothing (just the thought).
+    /// novel being read. DEFAULTS TO `--input` when omitted (so the gent retrieves over the very text
+    /// he's reading — the showcase shape). Hits feed back into a grounded/woven aside.
     #[arg(long)]
     rag_corpus: Option<String>,
 
-    /// Embedding-model GGUF (e.g. harrier-oss-v1-270m). With `--rag-corpus`, retrieval becomes HYBRID:
-    /// BM25 and semantic-cosine rankings fused by Reciprocal Rank Fusion (k=60). Requires the llama
-    /// backend; embeds the corpus once at startup.
-    #[arg(long)]
+    /// Embedding-model GGUF. Retrieval becomes HYBRID: BM25 and semantic-cosine rankings fused by
+    /// Reciprocal Rank Fusion (k=60). Requires the llama backend; embeds the corpus once at startup.
+    /// Defaults to the showcase embedder `models/harrier-oss-v1-270m-BF16.gguf`; set to "" to fall back
+    /// to lexical-only (BM25) retrieval.
+    #[arg(long, default_value = "models/harrier-oss-v1-270m-BF16.gguf")]
     rag_embed_model: Option<String>,
 
-    #[command(subcommand)]
+    /// Which frontend to run. `demo-tui` (default) = the SHOWCASE: clean stage, prose + the lobe's
+    /// asides (add `--scene` for the pixel-art study skin). `debug-tui` = the calibration INSTRUMENT
+    /// (sparkline, z-heatmap, trigger list, live knobs). `headless` = stdin → JSONL on stdout (the
+    /// harness-pipe shape).
+    #[arg(long, value_enum, default_value_t = Mode::DemoTui)]
     mode: Mode,
+
+    // ── Mode-specific options (flattened from the old subcommands; each applies in the modes noted) ──
+    /// [demo-tui/debug-tui] Transcript file to stream through the observer. The novel-reading showcase:
+    /// `--input corpus/pg2701.txt`. (headless reads the stream from stdin instead.)
+    #[arg(long, default_value = "sample_thinking.txt")]
+    input: String,
+
+    /// [demo-tui/debug-tui] Milliseconds between tokens (paces the stream so you can watch it).
+    #[arg(long, default_value_t = 30)]
+    tick_ms: u64,
+
+    /// [demo-tui/debug-tui] Start streaming at the first occurrence of this substring, skipping
+    /// everything before it — e.g. `--skip-to "Call me Ishmael"` to skip a book's front-matter (license
+    /// / table of contents / etymology) to the narrative. Empty = start at the beginning.
+    #[arg(long, default_value = "")]
+    skip_to: String,
+
+    /// [demo-tui] The pixel-art SCENE skin: the observer as a bearded gent in a Victorian study (a
+    /// half-block pixel-art scene) with each aside as a speech bubble, and the prose reduced to a quiet
+    /// ticker. ON by default (the showcase); `--no-scene` falls back to the plain clean stage. Ignored
+    /// by the other modes.
+    #[arg(long = "no-scene", default_value_t = false)]
+    no_scene: bool,
+
+    /// [headless] Granularity of a stream "token" as read from stdin.
+    #[arg(long, value_enum, default_value_t = Granularity::Line)]
+    granularity: Granularity,
+
+    /// [headless] Emit a uniform `step` event for every scored token (fired or not), alongside any
+    /// `trigger` events — so an offline threshold sweep gets a complete per-token stream.
+    #[arg(long, default_value_t = false)]
+    all_steps: bool,
+
+    /// [headless] Use the FUSED concurrent forward pass (CONCURRENT_FORWARD_PASS): observation and
+    /// interjection generation co-batch into one decode per stream token, so observation never stalls
+    /// (the interjection forms in the background, emitting ~N tokens after its trigger). Default off →
+    /// the blocking path (interjection attached to its trigger). Mutually exclusive with --rag.
+    #[arg(long, default_value_t = false)]
+    fused: bool,
 }
 
 impl Cli {
@@ -242,71 +305,41 @@ impl Cli {
     fn interject_on(&self) -> bool {
         !self.no_interject
     }
+
+    /// Stream framing (#5), ON by default; `--no-frame` disables. (Context interject-mode also forces
+    /// it on — see `with_lobe`.)
+    fn frame(&self) -> bool {
+        !self.no_frame
+    }
+
+    /// #8 RAG retrieval, ON by default; `--no-rag` disables.
+    fn rag(&self) -> bool {
+        !self.no_rag
+    }
+
+    /// The pixel-art scene skin (demo-tui), ON by default; `--no-scene` falls back to the plain stage.
+    fn scene(&self) -> bool {
+        !self.no_scene
+    }
+
+    /// The corpus the `search` tool retrieves over — `--rag-corpus`, defaulting to `--input` (the text
+    /// being read) when omitted, so by default the gent retrieves over his own reading.
+    fn rag_corpus_path(&self) -> &str {
+        self.rag_corpus.as_deref().unwrap_or(&self.input)
+    }
 }
 
-#[derive(Subcommand)]
+/// Which frontend to run (selected by `--mode`). Was a clap subcommand; flattened to a value-enum flag
+/// so every option lives at one level (mode-specific options are now top-level `--` flags). Variant
+/// names map to kebab-case on the CLI (`DebugTui` → `debug-tui`).
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
 enum Mode {
-    /// Read the stream from stdin, emit JSONL events on stdout.
-    Headless {
-        /// Granularity of a stream "token" as read from stdin.
-        #[arg(long, value_enum, default_value_t = Granularity::Line)]
-        granularity: Granularity,
-
-        /// Emit a uniform `step` event for every scored token (fired or not), alongside any
-        /// `trigger` events — so an offline threshold sweep gets a complete per-token stream.
-        #[arg(long, default_value_t = false)]
-        all_steps: bool,
-
-        /// Use the FUSED concurrent forward pass (CONCURRENT_FORWARD_PASS): observation and
-        /// interjection generation co-batch into one decode per stream token, so observation never
-        /// stalls (the interjection forms in the background and emits ~N tokens after its trigger).
-        /// Default off → the blocking path (interjection attached to its trigger). Mutually exclusive
-        /// with --rag.
-        #[arg(long, default_value_t = false)]
-        fused: bool,
-    },
-    /// Pace a transcript file through the observer in a live TUI.
-    Tui {
-        /// Transcript file to stream through the observer. Defaults to the bundled
-        /// `sample_thinking.txt` demo (a reasoning stream with planted anomalies).
-        #[arg(long, default_value = "sample_thinking.txt")]
-        input: String,
-
-        /// Milliseconds between tokens (paces the stream so you can watch it).
-        #[arg(long, default_value_t = 40)]
-        tick_ms: u64,
-
-        /// Start streaming at the first occurrence of this substring, skipping everything before it.
-        /// For the novel-reading demo: skip a book's front-matter (license / table of contents /
-        /// etymology) straight to the narrative, e.g. `--skip-to "Call me Ishmael"`. Empty = start
-        /// at the beginning. (The structural front-matter is the least-watchable part and the hardest
-        /// to gate — see CLAUDE.md; reading the narrative is what "watch it read the novel" means.)
-        #[arg(long, default_value = "")]
-        skip_to: String,
-    },
-    /// Presentation view: a clean stage that just shows the lobe reading and musing — the prose
-    /// streaming past while asides form alongside it. No debug chrome (vs `tui`, the instrument).
-    Present {
-        /// Transcript file to stream. The novel-reading showcase: `--input corpus/pg2701.txt`.
-        #[arg(long, default_value = "sample_thinking.txt")]
-        input: String,
-
-        /// Milliseconds between tokens (paces the stream; a calmer default than `tui` for watching).
-        #[arg(long, default_value_t = 30)]
-        tick_ms: u64,
-
-        /// Start at the first occurrence of this substring (skip front-matter), e.g.
-        /// `--skip-to "Call me Ishmael"`. Empty = start at the beginning.
-        #[arg(long, default_value = "")]
-        skip_to: String,
-
-        /// Cosmetic SCENE skin: render the observer as a bearded gent in a Victorian study (a
-        /// half-block pixel-art scene) with each aside as a speech bubble, and the prose reduced to a
-        /// quiet ticker. Same observe→react loop as plain `present`; just a different stage. Off by
-        /// default (plain `present` is the default view).
-        #[arg(long, default_value_t = false)]
-        scene: bool,
-    },
+    /// stdin → JSONL on stdout (the harness-pipe shape).
+    Headless,
+    /// The calibration instrument: sparkline, z-heatmap, trigger list, live knobs.
+    DebugTui,
+    /// The showcase: clean stage, prose + the lobe's asides (+ `--scene` for the pixel-art study).
+    DemoTui,
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -340,11 +373,36 @@ fn main() -> Result<()> {
 
     // Structured observability (--debug-log): install the JSONL subscriber FIRST so every subsequent
     // event is captured. `_trace_guard` must live for the whole run (drop flushes the writer).
+    // `tracing` subscribers are global across threads, so the presentation WORKER thread's events are
+    // captured too; `present_worker::run` joins the worker before returning, keeping this guard alive.
     let _trace_guard = match &cli.debug_log {
         Some(path) => Some(trace::init(path)?),
         None => None,
     };
 
+    // `Mode` is Copy, so matching it doesn't borrow `cli` — the mode-specific options are now plain
+    // top-level fields read directly off `cli`.
+    match cli.mode {
+        Mode::Headless => with_lobe(&cli, |lobe, retrieve| {
+            run_headless(lobe, &cli, cli.granularity, cli.all_steps, cli.fused, retrieve)
+        }),
+        Mode::DebugTui => with_lobe(&cli, |lobe, retrieve| {
+            tui::run(lobe, &cli, &cli.input, cli.tick_ms, &cli.skip_to, retrieve)
+        }),
+        // The showcase runs ALL llama work on a worker thread (so the scene animation never stalls on
+        // retrieval / ask-prefill); the worker builds its own engine + lobe via `with_lobe`.
+        Mode::DemoTui => present_worker::run(cli.clone()),
+    }
+}
+
+/// Build the engine, lobe, and retriever — all share self-referential `&engine` borrows, so they
+/// must live in one stack frame — prime the sink, then hand `&mut Lobe` + the retrieval fn to `body`.
+/// Every run mode funnels its construction through here; the presentation worker calls it on its own
+/// thread so the `!Send` llama handles are created and destroyed entirely on that thread.
+pub(crate) fn with_lobe<R>(
+    cli: &Cli,
+    body: impl FnOnce(&mut Lobe, &mut crate::retrieval::RetrieveFn) -> Result<R>,
+) -> Result<R> {
     let engine = ActiveBackend::load(&cli.model, cli.gpu_layers, cli.verbose)?;
     // All construction-time config in one value (no post-`new` setters, no before-`prime` ordering
     // hazard). Determinism: byte-identical by default (seed None = fixed reproducible RNG + hard
@@ -363,14 +421,15 @@ fn main() -> Result<()> {
         interject_temp: cli.interject_temp,
         interject_top_p: cli.interject_top_p,
         interject_max: cli.interject_max,
+        prefill_chunk: cli.prefill_chunk,
         refractory: cli.refractory,
         dedup: cli.dedup,
         debug: trace::DebugCfg {
             topk: cli.debug_topk,
             full_logits: cli.debug_full_logits,
         },
-        seed: cli.non_deterministic.then(entropy_seed),
-        fire_softness: if cli.non_deterministic { 0.5 } else { 0.0 },
+        seed: (!cli.deterministic).then(entropy_seed),
+        fire_softness: if cli.deterministic { 0.0 } else { 0.5 },
     };
     let mut lobe = Lobe::new(&engine, cli.ctx, config)?;
 
@@ -378,12 +437,12 @@ fn main() -> Result<()> {
     tracing::info!(
         target: "lobe::run", kind = "run_start",
         model = %cli.model, ctx = cli.ctx as u64, z = cli.z as f64, warmup = cli.warmup,
-        signal = ?cli.signal, identifiers_only = cli.identifiers_only, frame = cli.frame,
+        signal = ?cli.signal, identifiers_only = cli.identifiers_only, frame = cli.frame(),
         interject_mode = ?cli.interject_mode, refractory = cli.refractory as u64,
         dedup = cli.dedup as f64, adapt = cli.adapt as u64, evict = ?cli.evict,
         keep_recent = cli.keep_recent as u64,
         interject_temp = cli.interject_temp as f64, interject_top_p = cli.interject_top_p as f64,
-        non_deterministic = cli.non_deterministic,
+        non_deterministic = !cli.deterministic,
         "run_start"
     );
 
@@ -391,23 +450,24 @@ fn main() -> Result<()> {
     // attention sink, the observer framing, AND exactly what roll() replays verbatim on every
     // reset. (c): the built-in default is used unless --preamble overrides it.
     // (file takes precedence over --preamble; trimmed so a trailing newline doesn't enter the sink).
-    let system_prompt: String = if let Some(path) = &cli.preamble_file {
-        std::fs::read_to_string(path)
+    // Precedence: --preamble-file (a non-empty path) > --preamble > built-in default. The persona file
+    // defaults to the showcase persona, so an EMPTY `--preamble-file ""` is the escape hatch that drops
+    // back to --preamble / the built-in (otherwise the default file would always shadow --preamble).
+    let system_prompt: String = match cli.preamble_file.as_deref() {
+        Some(path) if !path.is_empty() => std::fs::read_to_string(path)
             .with_context(|| format!("failed to read --preamble-file {path}"))?
             .trim()
-            .to_string()
-    } else if cli.preamble.is_empty() {
-        DEFAULT_SYSTEM_PROMPT.to_string()
-    } else {
-        cli.preamble.clone()
+            .to_string(),
+        _ if cli.preamble.is_empty() => DEFAULT_SYSTEM_PROMPT.to_string(),
+        _ => cli.preamble.clone(),
     };
     // 1d (latent-bug hygiene): context interject-mode's ask opens with `<turn|>` (turn-close), which
-    // is only well-formed if the preamble opened a `<|turn>model` turn — i.e. with --frame. Since
-    // --frame defaults off but --interject-mode defaults to `context`, a default invocation would
-    // build malformed prompts. Derive an effective frame flag so context mode always frames.
-    let frame = cli.frame || cli.interject_mode == InterjectMode::Context;
-    if cli.interject_mode == InterjectMode::Context && !cli.frame {
-        eprintln!("[lobe] context interject-mode requires framing; enabling --frame implicitly");
+    // is only well-formed if the preamble opened a `<|turn>model` turn — i.e. with framing. Since
+    // --interject-mode defaults to `context`, derive an effective frame flag so context mode always
+    // frames even if `--no-frame` was passed.
+    let frame = cli.frame() || cli.interject_mode == InterjectMode::Context;
+    if cli.interject_mode == InterjectMode::Context && !cli.frame() {
+        eprintln!("[lobe] context interject-mode requires framing; enabling it implicitly");
     }
     // #5: with frame the persona goes in gemma-4's dedicated SYSTEM turn (see prompt::system_preamble
     // for the chat-format rationale); add_bos=true — BOS is the canonical first attention sink.
@@ -417,43 +477,10 @@ fn main() -> Result<()> {
 
     // Build the retrieval function ONCE (it's the mode-agnostic `--rag` seam): HYBRID RRF (embed model
     // + corpus) > LEXICAL BM25 (corpus only) > none; a no-op without `--rag` (so `step()`/`handle_rag`
-    // see `None` and behave as plain interjection). In a live mode the per-fire query embed +
-    // ask-prefill briefly serialize, but the aside itself still streams concurrently.
-    let mut retrieve = build_retriever(&engine, &cli)?;
+    // see `None` and behave as plain interjection).
+    let mut retrieve = build_retriever(&engine, cli)?;
 
-    // Borrow `cli.mode` rather than moving out of it — the handlers also take `&cli`, so a
-    // partial move of `cli.mode` (the non-Copy `input: String`) would invalidate that borrow.
-    match &cli.mode {
-        Mode::Headless {
-            granularity,
-            all_steps,
-            fused,
-        } => run_headless(
-            &mut lobe,
-            &cli,
-            *granularity,
-            *all_steps,
-            *fused,
-            retrieve.as_mut(),
-        ),
-        Mode::Tui {
-            input,
-            tick_ms,
-            skip_to,
-        } => tui::run(&mut lobe, &cli, input, *tick_ms, skip_to, retrieve.as_mut()),
-        Mode::Present {
-            input,
-            tick_ms,
-            skip_to,
-            scene,
-        } => {
-            if *scene {
-                present_scene::run(&mut lobe, &cli, input, *tick_ms, skip_to, retrieve.as_mut())
-            } else {
-                present::run(&mut lobe, &cli, input, *tick_ms, skip_to, retrieve.as_mut())
-            }
-        }
-    }
+    body(&mut lobe, retrieve.as_mut())
 }
 
 /// Headless: stdin -> scored tokens -> JSONL on stdout.
@@ -630,18 +657,18 @@ fn build_retriever<'a>(
     cli: &Cli,
 ) -> Result<Box<crate::retrieval::RetrieveFn<'a>>> {
     const CHUNK_WORDS: usize = 80;
-    if !cli.rag {
+    if !cli.rag() {
         return Ok(Box::new(|_q: &str| None));
     }
-    let corpus_text = match &cli.rag_corpus {
-        Some(path) => Some(
-            std::fs::read_to_string(path)
-                .with_context(|| format!("failed to read --rag-corpus {path}"))?,
-        ),
-        None => None,
-    };
-    match (corpus_text, &cli.rag_embed_model) {
-        (Some(text), Some(embed_path)) => {
+    // The corpus defaults to --input (the text being read) when --rag-corpus is omitted.
+    let corpus_path = cli.rag_corpus_path();
+    let text = std::fs::read_to_string(corpus_path)
+        .with_context(|| format!("failed to read rag corpus {corpus_path}"))?;
+    // The embed model defaults to the showcase embedder; an empty `--rag-embed-model ""` opts down to
+    // lexical-only (BM25) retrieval.
+    let embed_path = cli.rag_embed_model.as_deref().filter(|p| !p.is_empty());
+    match embed_path {
+        Some(embed_path) => {
             #[cfg(feature = "llama")]
             {
                 // One chunking shared by both indexes (RRF fuses by chunk index, so they must align).
@@ -667,11 +694,10 @@ fn build_retriever<'a>(
                 anyhow::bail!("--rag-embed-model requires the llama backend")
             }
         }
-        (Some(text), None) => {
+        None => {
             let corpus = retrieval::index(&text, CHUNK_WORDS);
             Ok(Box::new(move |q: &str| retrieval::search(&corpus, q)))
         }
-        _ => Ok(Box::new(|_q: &str| None)),
     }
 }
 
@@ -710,7 +736,7 @@ fn handle_rag(
 
 /// Each input chunk (line or word) is tokenized and each of its tokens is observed and
 /// scored individually, so a single noisy line can produce several events. Designed to
-/// be piped: `cat thinking_stream.txt | streaming-lobe --model m.gguf headless`.
+/// be piped: `cat thinking_stream.txt | streaming-lobe --model m.gguf --mode headless`.
 #[allow(clippy::too_many_arguments)]
 fn run_headless(
     lobe: &mut Lobe,
@@ -721,7 +747,7 @@ fn run_headless(
     retrieve: &mut crate::retrieval::RetrieveFn<'_>,
 ) -> Result<()> {
     let interject = cli.interject_on(); // global flag (on by default; --no-interject disables)
-    let rag = cli.rag;
+    let rag = cli.rag();
     let mut stats = Welford::new(cli.warmup, cli.adapt);
     let signal_name = match cli.signal {
         Signal::Surprisal => "surprisal",

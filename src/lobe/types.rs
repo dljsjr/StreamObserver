@@ -116,6 +116,11 @@ pub struct LobeConfig {
     pub interject_temp: f32,
     pub interject_top_p: f32,
     pub interject_max: usize,
+    /// Ask tokens prefilled per tick when a fused interjection starts (CHUNKED PREFILL; ≥1). Smaller =
+    /// smoother prose scroll during the prefill (each tick's decode stays lighter) but the aside takes
+    /// more ticks to start; larger = the aside starts sooner but the per-tick decode is heavier. The
+    /// old behavior was "the whole ask in one decode" (a ~250–500ms stream freeze at each fire).
+    pub prefill_chunk: usize,
     /// Post-fire refractory period (tokens; 0 = off) and the opt-in dedup backstop (0 = off).
     pub refractory: usize,
     pub dedup: f32,
@@ -142,6 +147,7 @@ impl Default for LobeConfig {
             interject_temp: 0.7,
             interject_top_p: 0.95,
             interject_max: 96,
+            prefill_chunk: 8,
             refractory: 0,
             dedup: 0.0,
             debug: crate::trace::DebugCfg::default(),
