@@ -25,7 +25,7 @@
 
 use anyhow::Result;
 use clap::ValueEnum;
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 
 /// How many of the most-recently-observed token texts to keep as rolling context for the
 /// chat-framed interjection prompt. Small on purpose: enough to situate the observer, but it
@@ -67,13 +67,6 @@ const RESET_MARGIN: i32 = 256;
 /// Tokens after a reset during which triggers are suppressed: the context is momentarily shorter,
 /// so the first few surprisals shift until the window refills. Keeps a reset from self-firing.
 const RESET_SETTLE: usize = 16;
-/// How many recent interjections to compare against for near-duplicate suppression.
-const DEDUP_HISTORY: usize = 6;
-/// Leading words that define an interjection's "opening stem" for theme dedup. 2 measured best on
-/// the catalog (collapses "The repetition. It's stark" with "The repetition. It's a stutter") while
-/// `DEDUP_HISTORY`'s short window keeps distant same-opening reactions; higher under-collapses theme
-/// recurrence, and the model varies openings enough that 2 didn't merge distinct "The word X" lines.
-const DEDUP_OPENING_WORDS: usize = 2;
 /// Cap on the "delta" span (tokens since the last fire) handed to a context-mode interjection, so a
 /// long quiet stretch can't blow up the prompt. The span ends with the surprising token.
 const MAX_SPAN_TOKENS: usize = 128;
@@ -131,6 +124,11 @@ pub use rag::Source;
 mod interject;
 use interject::InterjectState;
 pub use interject::InterjectStatus;
+
+// Interjection anti-fixation memory (recent asides + delta span + dedup) lives in its own module —
+// pure state, no session. `Lobe` holds one and delegates the dedup/novelty queries to it.
+mod novelty;
+use novelty::InterjectionMemory;
 
 // Backend abstraction (docs/BACKEND.md): the observer talks only to these traits + types, never to
 // a concrete inference engine. `ActiveBackend` is the cfg-selected impl (llama today, candle later).
@@ -232,18 +230,9 @@ pub struct Lobe<'a> {
     /// default to the control variant, so behavior is unchanged unless a flag is set.
     ask_mode: AskMode,
     novelty_mode: NoveltyMode,
-    /// Recent emitted interjection texts, for near-duplicate suppression (the observer shouldn't
-    /// repeat the same observation while a salient thing lingers in the window).
-    recent_interjections: VecDeque<String>,
-    /// Jaccard word-overlap threshold above which a new interjection is treated as a repeat and
-    /// suppressed. 0 disables dedup.
-    dedup_threshold: f32,
-    /// Token texts observed since the last fire — the "delta" the next interjection focuses on, so
-    /// each one reacts to *new* content instead of re-reflecting on the dominant feature of the
-    /// whole window. A text buffer (not KV positions), so it's immune to cap+reset / window slide.
-    since_last_fire: VecDeque<String>,
-    /// The delta span captured at the last fire (what `interject` in Context mode focuses on).
-    last_span: String,
+    /// Interjection anti-fixation memory: recent asides (novelty memory) + the delta-since-last-fire
+    /// span + the opt-in dedup backstop. Pure state (no session); see `novelty::InterjectionMemory`.
+    memory: InterjectionMemory,
     /// Structured-observability detail level (`--debug-log`). Inert unless a tracing subscriber is
     /// installed (the `enabled!` guards skip all dump work otherwise).
     debug: crate::trace::DebugCfg,
@@ -334,10 +323,7 @@ impl<'a> Lobe<'a> {
             interject_mode: InterjectMode::Context,
             ask_mode: AskMode::Passage, // control
             novelty_mode: NoveltyMode::Fresh, // control
-            recent_interjections: VecDeque::new(),
-            dedup_threshold: 0.0,
-            since_last_fire: VecDeque::new(),
-            last_span: String::new(),
+            memory: InterjectionMemory::default(),
             debug: crate::trace::DebugCfg::default(),
             interject_temp: 0.7, // default: the fixation fix (see set_interject_sampling / main)
             interject_top_p: 0.95,
@@ -431,8 +417,7 @@ impl<'a> Lobe<'a> {
             && self.crosses(z, z_threshold);
         if fired {
             self.refractory = self.refractory_period;
-            self.last_span = self.since_last_fire.iter().map(String::as_str).collect();
-            self.since_last_fire.clear();
+            self.memory.snapshot_span();
         }
         FireOutcome { fired, suppressed, in_refractory, gate }
     }
@@ -529,80 +514,31 @@ impl<'a> Lobe<'a> {
 
     /// Set the near-duplicate interjection suppression threshold (Jaccard word overlap; 0 = off).
     pub fn set_dedup(&mut self, threshold: f32) {
-        self.dedup_threshold = threshold;
+        self.memory.set_dedup(threshold);
     }
 
-    /// Append an observed token's text to the rolling "delta since last fire" buffer (capped).
-    fn push_span(&mut self, text: &str) {
-        self.since_last_fire.push_back(text.to_string());
-        while self.since_last_fire.len() > MAX_SPAN_TOKENS {
-            self.since_last_fire.pop_front();
-        }
-    }
-
-    /// Record an emitted interjection so the NEXT ask can show it as novelty memory
-    /// (`interject_ask_context`, the 1b fix). This is the PRIMARY anti-fixation mechanism — it feeds
-    /// the model what it just said so it can move on, rather than filtering a duplicate after the
-    /// fact. Call on every emitted interjection. (Distinct from `interjection_is_novel`, the
-    /// post-hoc dedup filter, which only records when `dedup_threshold > 0` and is now a backstop.)
+    /// Record an emitted interjection as novelty memory for the next ask (see
+    /// `InterjectionMemory::record` — the primary anti-fixation mechanism).
     pub fn record_interjection(&mut self, text: &str) {
-        let text = text.trim();
-        if text.is_empty() {
-            return;
-        }
-        self.recent_interjections.push_back(text.to_string());
-        while self.recent_interjections.len() > DEDUP_HISTORY {
-            self.recent_interjections.pop_front();
-        }
+        self.memory.record(text);
     }
 
-    /// PURE check (no recording — that's `record_interjection`'s job now): is `text` novel vs the
-    /// recently-emitted interjections? Returns false (a repeat) if its opening stem matches a recent
-    /// one, or char-shingle Jaccard exceeds `dedup_threshold`. This is the OPT-IN backstop filter
-    /// (default off, `--dedup 0`); the primary anti-fixation mechanism is the novelty memory in the
-    /// ask (1b). Returns true (always novel) when dedup is disabled.
+    /// Is `text` novel vs the recently-emitted interjections? (Opt-in dedup backstop; always true
+    /// when dedup is off. See `InterjectionMemory::is_novel`.)
     pub fn interjection_is_novel(&self, text: &str) -> bool {
-        if self.dedup_threshold <= 0.0 {
-            return true;
-        }
-        let open = opening(text, DEDUP_OPENING_WORDS);
-        let sh = shingles(text);
-        !self.recent_interjections.iter().any(|prev| {
-            opening(prev, DEDUP_OPENING_WORDS) == open
-                || jaccard(&sh, &shingles(prev)) > self.dedup_threshold
-        })
+        self.memory.is_novel(text)
     }
 
-    /// EARLY dedup for streaming frontends: true once an in-flight interjection's *opening stem* is
-    /// known AND already matches a recently-emitted one — i.e. it WILL be a duplicate — so the
-    /// frontend can abort and never render it (instead of streaming it live then dropping it at
-    /// `Done`). Only with dedup enabled; needs the opening stem complete to judge. (The opening stem
-    /// is the dominant repeat signal; the full shingle backstop isn't checkable mid-stream and is
-    /// dropped on this path — a fair trade to avoid render-then-delete.)
+    /// EARLY streaming dedup: will an in-flight interjection be a duplicate once its opening stem is
+    /// known? Lets a frontend abort before rendering. See `InterjectionMemory::doomed`.
     pub fn interjection_doomed(&self, partial: &str) -> bool {
-        if self.dedup_threshold <= 0.0 || !self.opening_complete(partial) {
-            return false;
-        }
-        let open = opening(partial, DEDUP_OPENING_WORDS);
-        self.recent_interjections
-            .iter()
-            .any(|prev| opening(prev, DEDUP_OPENING_WORDS) == open)
+        self.memory.doomed(partial)
     }
 
-    /// True when there's enough of an in-flight interjection to decide novelty: dedup off → always
-    /// (stream immediately, no change), else once the opening stem is complete. A streaming frontend
-    /// buffers (shows a neutral "thinking…") until this, then reveals if not `interjection_doomed`.
+    /// Is there enough of an in-flight interjection to decide novelty yet? See
+    /// `InterjectionMemory::decidable`.
     pub fn interjection_decidable(&self, partial: &str) -> bool {
-        self.dedup_threshold <= 0.0 || self.opening_complete(partial)
-    }
-
-    /// Does `text` already contain a full `DEDUP_OPENING_WORDS`-word opening stem?
-    fn opening_complete(&self, text: &str) -> bool {
-        opening(text, DEDUP_OPENING_WORDS)
-            .split(' ')
-            .filter(|w| !w.is_empty())
-            .count()
-            >= DEDUP_OPENING_WORDS
+        self.memory.decidable(partial)
     }
 
     /// Abort an in-flight streaming interjection (a frontend decided not to show it): drop the
@@ -823,7 +759,7 @@ impl<'a> Lobe<'a> {
         if self.last_logits.is_empty() {
             let text = self.detok(tok);
             self.remember(&text);
-            self.push_span(&text);
+            self.memory.push_span(&text);
             self.decode_one(tok)?;
             self.push_recent_id(tok);
             let idx = self.stream_index;
@@ -853,7 +789,7 @@ impl<'a> Lobe<'a> {
 
         let text = self.detok(tok);
         self.remember(&text);
-        self.push_span(&text); // grow the delta-since-last-fire buffer; current token ends the span
+        self.memory.push_span(&text); // grow the delta-since-last-fire buffer; current token ends the span
 
         // Settle (#6 post-reset) + refractory + identifier gate (#4) + threshold crossing, and on a
         // fire arm the cooldown and snapshot the delta span — see fire_decision.
@@ -912,7 +848,7 @@ impl<'a> Lobe<'a> {
                 stream_index = self.stream_index as u64, token = %text, token_id = tok.0 as i64,
                 pos = pos_before as i64, surprisal = surprisal as f64, entropy = entropy as f64,
                 z = z as f64, baseline_mean = stats.mean() as f64, baseline_std = stats.std() as f64,
-                delta_span = %self.last_span, logits = logit_dump.as_deref().unwrap_or(""),
+                delta_span = %self.memory.last_span, logits = logit_dump.as_deref().unwrap_or(""),
                 full_logits = full_logits.as_deref().unwrap_or(""),
                 context = %self.full_context_text(),
                 "trigger"
@@ -953,7 +889,7 @@ impl<'a> Lobe<'a> {
         if self.last_logits.is_empty() {
             let text = self.detok(stream_tok);
             self.remember(&text);
-            self.push_span(&text);
+            self.memory.push_span(&text);
             self.decode_one(stream_tok)?;
             self.push_recent_id(stream_tok);
             let idx = self.stream_index;
@@ -996,7 +932,7 @@ impl<'a> Lobe<'a> {
 
         let text = self.detok(stream_tok);
         self.remember(&text);
-        self.push_span(&text);
+        self.memory.push_span(&text);
 
         // Shared firing decision (settle/refractory/gate/crossing + span capture) — see fire_decision.
         let fired = self.fire_decision(&text, z, z_threshold, stats).fired;
@@ -1101,7 +1037,7 @@ impl<'a> Lobe<'a> {
                 target: "lobe::trigger", kind = "trigger", fused = true,
                 stream_index = self.stream_index as u64, token = %text, token_id = stream_tok.0 as i64,
                 pos = (self.pos - 1) as i64, surprisal = surprisal as f64, entropy = entropy as f64,
-                z = z as f64, delta_span = %self.last_span,
+                z = z as f64, delta_span = %self.memory.last_span,
                 logits = logit_dump.as_deref().unwrap_or(""),
                 "trigger"
             );
@@ -1233,20 +1169,6 @@ fn looks_like_identifier(text: &str) -> bool {
     has_underscore || has_digit || starts_upper
 }
 
-/// Character n-gram (shingle) set of a normalized string, for interjection dedup. More robust than
-/// word sets when two interjections share a long opening but diverge in the tail (the common case:
-/// "The structure… a catalog of mundane things" vs "…a catalog of things") — word-set Jaccard gets
-/// diluted by the differing tails, char-shingle Jaccard stays high on the shared span.
-fn shingles(s: &str) -> HashSet<String> {
-    const N: usize = 4;
-    let norm = s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
-    let chars: Vec<char> = norm.chars().collect();
-    if chars.len() < N {
-        return std::iter::once(norm).collect();
-    }
-    chars.windows(N).map(|w| w.iter().collect()).collect()
-}
-
 /// Drop a leading partial-word fragment from a span of concatenated token pieces. Surprisal fires on
 /// subword tokens, so a span cut at a fire boundary can start mid-word: e.g. the trigger `ETY` (start
 /// of "ETYMOLOGY") ends one span, leaving the next span to begin with the orphan tail "MOLOGY". gemma
@@ -1273,34 +1195,6 @@ fn ends_sentence(s: &str) -> bool {
     t.ends_with(|c: char| matches!(c, '.' | '!' | '?' | '…'))
 }
 
-/// First `k` lowercased alphanumeric words of a string (its "opening stem"), for theme dedup.
-fn opening(s: &str, k: usize) -> String {
-    s.split_whitespace()
-        .map(|w| {
-            w.chars()
-                .filter(|c| c.is_alphanumeric())
-                .collect::<String>()
-                .to_lowercase()
-        })
-        .filter(|w| !w.is_empty())
-        .take(k)
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// Jaccard similarity (|∩| / |∪|) of two shingle sets.
-fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f32 {
-    if a.is_empty() && b.is_empty() {
-        return 1.0;
-    }
-    let inter = a.intersection(b).count() as f32;
-    let union = a.union(b).count() as f32;
-    if union == 0.0 {
-        0.0
-    } else {
-        inter / union
-    }
-}
 
 /// Index of the maximum logit, as a token (greedy argmax).
 fn argmax(logits: &[f32]) -> Token {

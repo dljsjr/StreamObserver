@@ -152,7 +152,7 @@ impl Lobe<'_> {
         // after fire, so we show the model what it just said and ask for a fresh angle — without ever
         // mentioning surprise. The full forked context stays available, so a genuine "X because of Y
         // from earlier" connection can still form.
-        let span = word_aligned(&self.last_span).trim();
+        let span = word_aligned(&self.memory.last_span).trim();
 
         // Novelty memory (H4). Off = omit it entirely; otherwise show the last 1–2 asides, with the
         // framing chosen by `novelty_mode` (Fresh = content novelty [control]; Form = form novelty).
@@ -160,10 +160,8 @@ impl Lobe<'_> {
             String::new()
         } else {
             let noted: String = self
-                .recent_interjections
-                .iter()
-                .rev()
-                .take(2)
+                .memory
+                .recent(2)
                 .map(|s| format!("- {}", s.trim()))
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -236,12 +234,12 @@ impl Lobe<'_> {
             stream_index = self.stream_index as u64, mode = ?self.interject_mode, forked,
             trigger_token = %surprising, start_pos = start_pos as i64,
             prompt_tokens = toks.len() as u64, max = max as u64,
-            delta_span = %word_aligned(&self.last_span).trim(),
+            delta_span = %word_aligned(&self.memory.last_span).trim(),
             // The delta span (above) and the ENTIRE live context (below), dumped separately: the span
             // is what the ask spotlights; `full_context` is the whole forked seq-0 the model reflects
             // over (framing + all stream tokens). Lazily evaluated — only when the trace is enabled.
             full_context = %self.full_context_text(),
-            novelty_memory = %self.recent_interjections.iter().rev().take(2)
+            novelty_memory = %self.memory.recent(2)
                 .cloned().collect::<Vec<_>>().join(" ||| "),
             prompt = %prompt_text, // the raw model input, verbatim
             "interject_begin"
