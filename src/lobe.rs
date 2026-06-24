@@ -130,6 +130,11 @@ pub use interject::InterjectStatus;
 mod novelty;
 use novelty::InterjectionMemory;
 
+// The firing decision (#4): trigger signal + identifier gate + refractory + stochastic-fire RNG.
+// Pure of inference state; `Lobe::fire_decision` orchestrates it with the window's `settle` + memory.
+mod firing;
+use firing::Firing;
+
 // Backend abstraction (docs/BACKEND.md): the observer talks only to these traits + types, never to
 // a concrete inference engine. `ActiveBackend` is the cfg-selected impl (llama today, candle later).
 use crate::backend::{ActiveBackend, Backend, Decode, Detok, Session, SessionConfig, Token};
@@ -184,9 +189,9 @@ pub struct Lobe<'a> {
     /// Rolling window of recently-observed token texts, used to situate the interjection
     /// prompt ("here is the recent text it produced"). Capped at `RECENT_TOKENS`.
     recent: VecDeque<String>,
-    /// Active trigger signal (#4) and whether firing is gated to identifier/entity-like tokens.
-    signal: Signal,
-    identifiers_only: bool,
+    /// Firing decision (#4): the trigger signal, identifier gate, refractory cooldown, stochastic-fire
+    /// RNG + softness. Pure of inference state; see `firing::Firing`.
+    firing: Firing,
     // --- #6 cap + reset state ---
     /// Context size the cache was built with (positions 0..n_ctx-1 are valid).
     n_ctx: i32,
@@ -210,11 +215,6 @@ pub struct Lobe<'a> {
     keep_recent: usize,
     /// Post-reset trigger-suppression countdown.
     settle: usize,
-    /// Post-fire refractory countdown: after the observer remarks, it stays quiet for
-    /// `refractory_period` tokens so it doesn't obsess over the same salient thing while it lingers
-    /// in the window. Counts down each observed token; reset to `refractory_period` on each fire.
-    refractory: usize,
-    refractory_period: usize,
     /// Count of resets so far (for the TUI status line / validation).
     resets: u64,
     /// Turn-boundary token ids (gemma chat). Used to stop interjection generation cleanly —
@@ -235,13 +235,6 @@ pub struct Lobe<'a> {
     debug: crate::trace::DebugCfg,
     /// xorshift64 state for interjection sampling; constant-seeded so a run is reproducible.
     rng_state: u64,
-    /// Independent xorshift64 state for the PROBABILISTIC firing decision (decorrelated from
-    /// `rng_state` so trigger draws and interjection draws don't interfere). Seeded alongside it.
-    fire_rng: u64,
-    /// Softness of the stochastic firing sigmoid, in z-units (`--fire-softness`). `<= 0` = the
-    /// deterministic hard threshold (`z >= z_threshold`, the default). `> 0` = fire with probability
-    /// `sigmoid((z - z_threshold)/softness)` — so triggers vary run-to-run under `--random-seed`.
-    fire_softness: f32,
 
     // --- Fused concurrent forward pass (CONCURRENT_FORWARD_PASS.md, TUI path only) ---
     // When an interjection is in flight, `step()` co-batches the next GEN_SEQ token with the stream
@@ -294,8 +287,7 @@ impl<'a> Lobe<'a> {
             pos: 0,
             stream_index: 0,
             recent: VecDeque::with_capacity(RECENT_TOKENS),
-            signal: Signal::Surprisal,
-            identifiers_only: false,
+            firing: Firing::default(),
             n_ctx: n_ctx as i32,
             evict: EvictMode::Reset,
             n_keep: 0,
@@ -304,8 +296,6 @@ impl<'a> Lobe<'a> {
             context_ids: Vec::new(),
             keep_recent: 4096,
             settle: 0,
-            refractory: 0,
-            refractory_period: 0,
             resets: 0,
             eot,
             sot,
@@ -314,8 +304,6 @@ impl<'a> Lobe<'a> {
             memory: InterjectionMemory::default(),
             debug: crate::trace::DebugCfg::default(),
             rng_state: 0x9E3779B97F4A7C15, // fixed seed → reproducible runs (overridden via set_seed)
-            fire_rng: 0x2545F4914F6CDD1D, // independent trigger-RNG stream (re-seeded in set_seed)
-            fire_softness: 0.0, // default: deterministic hard threshold (no stochastic firing)
             gen_in_flight: false,
             gen_pos: 0,
             pending_gen_tok: None,
@@ -351,38 +339,20 @@ impl<'a> Lobe<'a> {
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
         z ^= z >> 31;
-        self.fire_rng = if z == 0 { 0x2545F4914F6CDD1D } else { z };
+        self.firing.seed_rng(if z == 0 { 0x2545F4914F6CDD1D } else { z });
     }
 
     /// Set the stochastic-firing softness (z-units). `0` (default) = deterministic hard threshold;
-    /// `> 0` makes firing probabilistic (`sigmoid((z - threshold)/softness)`) off the seeded
-    /// `fire_rng`, so which tokens fire varies under `--random-seed` and reproduces under `--seed`.
+    /// `> 0` makes firing probabilistic (`sigmoid((z - threshold)/softness)`) off the seeded firing
+    /// RNG, so which tokens fire varies under `--random-seed` and reproduces under `--seed`.
     pub fn set_fire_softness(&mut self, softness: f32) {
-        self.fire_softness = softness;
+        self.firing.set_softness(softness);
     }
 
-    /// Decide whether surprisal `z` crosses the firing threshold. `fire_softness <= 0` → the exact
-    /// deterministic hard threshold (`z >= z_threshold`), drawing no randomness. `> 0` → a
-    /// PROBABILISTIC fire, `P = sigmoid((z - z_threshold)/softness)`, sampled from the seeded
-    /// `fire_rng`. The surprisal value itself is always the exact read off the forward pass; only the
-    /// fire/no-fire *decision* near the threshold is softened.
-    fn crosses(&mut self, z: f32, z_threshold: f32) -> bool {
-        if self.fire_softness <= 0.0 {
-            return z >= z_threshold;
-        }
-        let p = 1.0 / (1.0 + (-(z - z_threshold) / self.fire_softness).exp());
-        next_unit_f32(&mut self.fire_rng) < p
-    }
-
-    /// The firing decision, shared by `observe` and `step`. Advances the settle (#6, post-reset
-    /// suppression) and refractory counters, applies the identifier gate (#4) and the — possibly
-    /// stochastic — threshold crossing, and on a fire arms the refractory cooldown and snapshots the
-    /// delta span (tokens since the last fire). Returns whether the token fired. `text` is the
+    /// The firing decision, shared by `observe` and `step`. Advances the post-reset `settle` (#6)
+    /// suppression counter (owned here), then delegates the refractory + identifier gate + threshold
+    /// crossing to `Firing::decide`; on a fire it snapshots the delta span (memory). `text` is the
     /// just-decoded token's detok; `stats` is the running baseline (read-only here).
-    ///
-    /// Ordering matters: `crosses` is evaluated LAST (it may draw the firing RNG) so randomness is
-    /// consumed only once the cheap deterministic gates pass — keeping the draw sequence stable and
-    /// reproducible per seed.
     fn fire_decision(
         &mut self,
         text: &str,
@@ -392,16 +362,9 @@ impl<'a> Lobe<'a> {
     ) -> FireOutcome {
         let suppressed = self.settle > 0;
         self.settle = self.settle.saturating_sub(1);
-        let in_refractory = self.refractory > 0;
-        self.refractory = self.refractory.saturating_sub(1);
-        let gate = !self.identifiers_only || looks_like_identifier(text);
-        let fired = !suppressed
-            && !in_refractory
-            && gate
-            && stats.count() > stats.warmup()
-            && self.crosses(z, z_threshold);
+        let warm = stats.count() > stats.warmup();
+        let (fired, in_refractory, gate) = self.firing.decide(text, z, z_threshold, warm, suppressed);
         if fired {
-            self.refractory = self.refractory_period;
             self.memory.snapshot_span();
         }
         FireOutcome { fired, suppressed, in_refractory, gate }
@@ -541,14 +504,13 @@ impl<'a> Lobe<'a> {
 
     /// Configure the pluggable trigger signal (#4) and the identifier/entity firing gate.
     pub fn set_signal(&mut self, signal: Signal, identifiers_only: bool) {
-        self.signal = signal;
-        self.identifiers_only = identifiers_only;
+        self.firing.set_signal(signal, identifiers_only);
     }
 
     /// Post-fire refractory period (tokens): how long the observer stays quiet after remarking, so
     /// it doesn't obsess over the same salient thing while it lingers in the window. 0 disables.
     pub fn set_refractory(&mut self, period: usize) {
-        self.refractory_period = period;
+        self.firing.set_refractory(period);
     }
 
     /// Configure cap + reset (#6): eviction mode and how many recent stream tokens to replay on a
@@ -765,7 +727,7 @@ impl<'a> Lobe<'a> {
         // signal is active and feed THAT to the baseline, but report both for inspection.
         let surprisal = self.surprisal_of(tok);
         let entropy = self.entropy_of();
-        let fire_value = match self.signal {
+        let fire_value = match self.firing.signal {
             Signal::Surprisal => surprisal,
             Signal::Entropy => entropy,
         };
@@ -819,7 +781,7 @@ impl<'a> Lobe<'a> {
                 stream_index = self.stream_index as u64, token = %text, token_id = tok.0 as i64,
                 pos_before = pos_before as i64, pos_after = self.pos as i64,
                 surprisal = surprisal as f64, entropy = entropy as f64, z = z as f64,
-                signal = ?self.signal, baseline_mean = stats.mean() as f64,
+                signal = ?self.firing.signal, baseline_mean = stats.mean() as f64,
                 baseline_std = stats.std() as f64, fired, suppressed_settle = suppressed,
                 in_refractory, gate_pass = gate, decode_us,
                 logits = logit_dump.as_deref().unwrap_or(""),
@@ -908,7 +870,7 @@ impl<'a> Lobe<'a> {
         // 2. Score the stream token against the PRIOR distribution (last_logits) — exactly observe().
         let surprisal = self.surprisal_of(stream_tok);
         let entropy = self.entropy_of();
-        let fire_value = match self.signal {
+        let fire_value = match self.firing.signal {
             Signal::Surprisal => surprisal,
             Signal::Entropy => entropy,
         };
@@ -1134,25 +1096,6 @@ impl<'a> Lobe<'a> {
     }
 }
 
-/// Heuristic: does this token's text look like an identifier or named entity — the kind of
-/// "objective" surprise worth flagging (a code identifier, a proper noun, a number-bearing
-/// token) rather than a rare-but-irrelevant function word? Used by the `--identifiers-only`
-/// firing gate (#4). Deliberately cheap and approximate.
-fn looks_like_identifier(text: &str) -> bool {
-    let t = text.trim();
-    if t.len() < 2 {
-        return false;
-    }
-    // Must be "wordy": only alphanumerics or underscores (no punctuation/whitespace inside).
-    if !t.chars().all(|c| c.is_alphanumeric() || c == '_') {
-        return false;
-    }
-    let has_digit = t.chars().any(|c| c.is_ascii_digit());
-    let has_underscore = t.contains('_');
-    let starts_upper = t.chars().next().is_some_and(char::is_uppercase);
-    // code-identifier-ish (snake_case / has a digit) OR proper-noun-ish (Capitalized).
-    has_underscore || has_digit || starts_upper
-}
 
 /// Drop a leading partial-word fragment from a span of concatenated token pieces. Surprisal fires on
 /// subword tokens, so a span cut at a fire boundary can start mid-word: e.g. the trigger `ETY` (start
