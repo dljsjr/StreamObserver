@@ -42,7 +42,7 @@ pub fn run(
     input_path: &str,
     tick_ms: u64,
     skip_to: &str,
-    retrieve: &mut crate::retrieval::RetrieveFn,
+    retrieve: &mut crate::retrieval::RetrieveFn<'_>,
 ) -> Result<()> {
     let interject = cli.interject_on(); // global flag (on by default; --no-interject disables)
     let interject_max = cli.interject_max;

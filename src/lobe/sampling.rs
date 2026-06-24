@@ -81,6 +81,22 @@ pub(crate) fn word_aligned(s: &str) -> &str {
     }
 }
 
+/// A word-aligned head of `s`, at most `max` bytes (back up to the last whitespace within the limit
+/// so a word isn't split). Keeps a retrieved chunk to a punchy quote in the #8 recall block.
+pub(crate) fn trim_snippet(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    match s[..end].rfind(char::is_whitespace) {
+        Some(i) if i > 0 => &s[..i],
+        _ => &s[..end],
+    }
+}
+
 /// True if a partial generation ends at a natural sentence boundary, so a soft length cap can stop
 /// here instead of mid-clause. Tolerant of trailing markdown emphasis and closing quotes/brackets
 /// (e.g. `…the void.”` or `…*insists.*`).

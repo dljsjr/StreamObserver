@@ -59,7 +59,7 @@ pub fn run(
     input_path: &str,
     tick_ms: u64,
     skip_to: &str,
-    retrieve: &mut crate::retrieval::RetrieveFn,
+    retrieve: &mut crate::retrieval::RetrieveFn<'_>,
 ) -> Result<()> {
     // Parse the scene + flame animation once, up front, so a malformed asset fails loudly before
     // entering raw mode.

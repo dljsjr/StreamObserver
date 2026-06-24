@@ -229,7 +229,7 @@ impl<B: Backend> Lobe<'_, B> {
         z_threshold: f32,
         topk: usize,
         interject_max: usize,
-        retrieve: &mut crate::retrieval::RetrieveFn,
+        retrieve: &mut crate::retrieval::RetrieveFn<'_>,
     ) -> Result<StepOutcome> {
         // Neutral first token (no prior distribution): feed it, no scoring, no interjection.
         if self.last_logits.is_empty() {

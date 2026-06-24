@@ -416,21 +416,10 @@ fn main() -> Result<()> {
     lobe.prime(&preamble_tokens)?;
 
     // Build the retrieval function ONCE (it's the mode-agnostic `--rag` seam): HYBRID RRF (embed model
-    // + corpus) > LEXICAL BM25 (corpus only) > none. `--rag` is the switch — without it, a no-op (so
-    // `step()` / `handle_rag` see `None` and behave as plain interjection). In a live mode the per-fire
-    // query embed + ask-prefill briefly serialize, but the aside itself still streams concurrently.
-    let mut retrieve: Box<crate::retrieval::RetrieveFn> = if cli.rag {
-        let corpus_text = match &cli.rag_corpus {
-            Some(path) => Some(
-                std::fs::read_to_string(path)
-                    .with_context(|| format!("failed to read --rag-corpus {path}"))?,
-            ),
-            None => None,
-        };
-        build_retriever(&engine, corpus_text.as_deref(), &cli.rag_embed_model)?
-    } else {
-        Box::new(|_q: &str| None)
-    };
+    // + corpus) > LEXICAL BM25 (corpus only) > none; a no-op without `--rag` (so `step()`/`handle_rag`
+    // see `None` and behave as plain interjection). In a live mode the per-fire query embed +
+    // ask-prefill briefly serialize, but the aside itself still streams concurrently.
+    let mut retrieve = build_retriever(&engine, &cli)?;
 
     // Borrow `cli.mode` rather than moving out of it — the handlers also take `&cli`, so a
     // partial move of `cli.mode` (the non-Copy `input: String`) would invalidate that borrow.
@@ -526,7 +515,7 @@ fn process_fused_token(
     stats: &mut Welford,
     cli: &Cli,
     signal: &str,
-    retrieve: &mut crate::retrieval::RetrieveFn,
+    retrieve: &mut crate::retrieval::RetrieveFn<'_>,
     out: &mut impl Write,
 ) -> Result<()> {
     let outcome = lobe.step(tok, stats, cli.z, cli.topk, cli.interject_max, retrieve)?;
@@ -565,7 +554,7 @@ fn process_observe_token(
     interject: bool,
     rag: bool,
     all_steps: bool,
-    retrieve: &mut crate::retrieval::RetrieveFn,
+    retrieve: &mut crate::retrieval::RetrieveFn<'_>,
     out: &mut impl Write,
 ) -> Result<bool> {
     let step = lobe.observe(tok, stats, cli.z, cli.topk)?;
@@ -631,34 +620,43 @@ const RAG_INSTRUCT: &str = "Instruct: Given a search query, retrieve relevant pa
 /// Reciprocal Rank Fusion constant (the canonical default).
 const RRF_K: f32 = 60.0;
 
-/// Build the `--rag` retrieval function (the seam `handle_rag` calls per query): HYBRID RRF (embed
-/// model + corpus: fuse BM25 and semantic rankings) > LEXICAL BM25 (corpus only) > none. The embedder
-/// owns a leaked `'static` model, so the returned closure is self-contained.
-fn build_retriever(
-    engine: &ActiveBackend,
-    corpus_text: Option<&str>,
-    rag_embed_model: &Option<String>,
-) -> Result<Box<crate::retrieval::RetrieveFn>> {
+/// Build the `--rag` retrieval function (the seam `step`/`handle_rag` call per query): HYBRID RRF
+/// (embed model + corpus: fuse BM25 and semantic rankings) > LEXICAL BM25 (corpus only) > none. The
+/// closure OWNS its indexes (and, in the hybrid case, the `EmbedderModel` — owned, not leaked, so it
+/// drops before the device at exit). Without `--rag` it's a no-op. The `'a` lifetime ties the closure
+/// to `engine` (the embedder borrows its runtime).
+fn build_retriever<'a>(
+    engine: &'a ActiveBackend,
+    cli: &Cli,
+) -> Result<Box<crate::retrieval::RetrieveFn<'a>>> {
     const CHUNK_WORDS: usize = 80;
-    match (corpus_text, rag_embed_model) {
+    if !cli.rag {
+        return Ok(Box::new(|_q: &str| None));
+    }
+    let corpus_text = match &cli.rag_corpus {
+        Some(path) => Some(
+            std::fs::read_to_string(path)
+                .with_context(|| format!("failed to read --rag-corpus {path}"))?,
+        ),
+        None => None,
+    };
+    match (corpus_text, &cli.rag_embed_model) {
         (Some(text), Some(embed_path)) => {
             #[cfg(feature = "llama")]
             {
                 // One chunking shared by both indexes (RRF fuses by chunk index, so they must align).
-                let chunks = retrieval::chunk(text, CHUNK_WORDS);
-                let mut embedder = engine.load_embedder(embed_path, 999, 2048)?;
+                let chunks = retrieval::chunk(&text, CHUNK_WORDS);
+                let embedder = engine.load_embedder(embed_path, 999, 2048)?; // owned (no leak)
                 eprintln!("[lobe] embedding {} corpus chunks for hybrid retrieval…", chunks.len());
-                let embeddings = chunks
-                    .iter()
-                    .map(|c| embedder.embed(c))
-                    .collect::<Result<Vec<_>>>()?;
-                let corpus = retrieval::index_chunks(chunks); // moves chunks (embeddings already built)
+                let embeddings = embedder.embed_all(&chunks)?; // one shared context for the corpus
+                let corpus = retrieval::index_chunks(chunks);
                 let semantic = retrieval::SemanticIndex::new(embeddings);
                 Ok(Box::new(move |q: &str| {
                     // Fuse BM25 (lexical) + semantic rankings with RRF — keeps both signals (exact-term
                     // hits AND paraphrase/concept matches) without normalizing their disparate scores.
+                    // embed_one spins up a transient context per query (sparse → cheap).
                     let bm = retrieval::rank_bm25(&corpus, q);
-                    let qe = embedder.embed(&format!("{RAG_INSTRUCT}{q}")).ok()?;
+                    let qe = embedder.embed_one(&format!("{RAG_INSTRUCT}{q}")).ok()?;
                     let sem = retrieval::rank_semantic(&semantic, &qe);
                     retrieval::rrf_best(&[&bm, &sem], RRF_K).map(|i| corpus.chunk_text(i).to_string())
                 }))
@@ -670,7 +668,7 @@ fn build_retriever(
             }
         }
         (Some(text), None) => {
-            let corpus = retrieval::index(text, CHUNK_WORDS);
+            let corpus = retrieval::index(&text, CHUNK_WORDS);
             Ok(Box::new(move |q: &str| retrieval::search(&corpus, q)))
         }
         _ => Ok(Box::new(|_q: &str| None)),
@@ -684,7 +682,7 @@ fn handle_rag(
     lobe: &mut Lobe,
     stream_index: usize,
     surprising: &str,
-    retrieve: &mut crate::retrieval::RetrieveFn,
+    retrieve: &mut crate::retrieval::RetrieveFn<'_>,
     out: &mut impl Write,
 ) -> Result<()> {
     // Retrieval is injected as a function argument (the pre-built `--rag` retriever).
@@ -720,7 +718,7 @@ fn run_headless(
     granularity: Granularity,
     all_steps: bool,
     fused: bool,
-    retrieve: &mut crate::retrieval::RetrieveFn,
+    retrieve: &mut crate::retrieval::RetrieveFn<'_>,
 ) -> Result<()> {
     let interject = cli.interject_on(); // global flag (on by default; --no-interject disables)
     let rag = cli.rag;

@@ -87,7 +87,7 @@ use window::StreamWindow;
 
 // Pure token-selection + text-shaping helpers; `pub(crate) use` so siblings reach them via `super::`.
 mod sampling;
-pub(crate) use sampling::{argmax, ends_sentence, next_unit_f32, sample_topp, word_aligned};
+pub(crate) use sampling::{argmax, ends_sentence, next_unit_f32, sample_topp, trim_snippet, word_aligned};
 
 // The scoring functional-core: pure functions of a logit slice (surprisal/entropy/top-k).
 mod scoring;
@@ -448,19 +448,31 @@ impl<'a, B: Backend> Lobe<'a, B> {
     /// and fit the batch (interjection prompts are kept well under the 512-token batch).
     fn decode_seq(&mut self, toks: &[Token], start_pos: i32, seq: i32) -> Result<Vec<f32>> {
         debug_assert!(!toks.is_empty(), "decode_seq requires at least one token");
-        let last = toks.len() - 1;
-        let batch: Vec<Decode> = toks
-            .iter()
-            .enumerate()
-            .map(|(i, &t)| Decode {
-                token: t,
-                pos: start_pos + i as i32,
-                seq: seq as u32,
-                logits: i == last,
-            })
-            .collect();
-        self.session.decode(&batch)?;
-        Ok(self.session.logits(last).to_vec())
+        // Chunk at the session batch capacity, exactly like prefill_seq0 — an ask can exceed 512
+        // tokens (a long delta span + novelty memory + a #8 recall block), and a single oversized
+        // decode would overrun the batch ("Insufficient Space of 512"). Logits only on the very last.
+        const CAP: usize = 512; // = backend BATCH_CAP
+        let n = toks.len();
+        let mut last_logits = Vec::new();
+        for start in (0..n).step_by(CAP) {
+            let end = (start + CAP).min(n);
+            let is_final = end == n;
+            let batch: Vec<Decode> = toks[start..end]
+                .iter()
+                .enumerate()
+                .map(|(i, &t)| Decode {
+                    token: t,
+                    pos: start_pos + (start + i) as i32,
+                    seq: seq as u32,
+                    logits: is_final && (start + i == n - 1),
+                })
+                .collect();
+            self.session.decode(&batch)?;
+            if is_final {
+                last_logits = self.session.logits(batch.len() - 1).to_vec();
+            }
+        }
+        Ok(last_logits)
     }
 
     pub fn position(&self) -> i32 {

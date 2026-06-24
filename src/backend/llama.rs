@@ -148,62 +148,87 @@ impl Session for LlamaSession<'_> {
 // A SECOND model (harrier-oss-v1-270m, a gemma3-arch embedding model) loaded into the SAME runtime as
 // the main model — `LlamaBackend::init()` guards double-init, so the embedder must share it. Lives
 // behind the llama feature; `main` uses it only when `--rag-embed-model` is given.
+//
+// `EmbedderModel` OWNS the model (no leak), so it drops normally before the device at exit — leaking
+// it would leave its Metal residency set non-empty when ggml frees the device, tripping a teardown
+// assert. To avoid a self-referential struct (a stored context borrows the model), it does NOT keep a
+// persistent context: it spins up a short-lived embeddings context per embed (one shared context for a
+// whole corpus batch; a fresh one per runtime query — cheap, and queries are sparse).
+
+/// A loaded embedding model. Make embeddings with `embed_all` (a batch through one context) or
+/// `embed_one` (a single text through a transient context). Owns the model; borrows the runtime.
+pub struct EmbedderModel<'a> {
+    rt: &'a LlamaRuntime,
+    model: LlamaModel,
+    n_ctx: u32,
+}
 
 impl LlamaBackend {
-    /// Load an embedding model into this backend's runtime and open a LAST-token-pooling embeddings
-    /// context. The model handle is leaked to `'static`: it's a process-lifetime resource (loaded once,
-    /// used till exit — like the main model), and leaking lets the returned `Embedder` own its context
-    /// without a self-referential struct or threaded lifetimes. Sound because the runtime (this
-    /// backend) outlives the run; `'static` here means "as long as the process", which it is.
-    pub fn load_embedder(&self, model_path: &str, gpu_layers: u32, n_ctx: u32) -> Result<Embedder> {
+    /// Load an embedding model into this backend's runtime. `n_ctx` bounds the longest text embedded in
+    /// one pass (a corpus chunk, or instruction+query). Owned (not leaked) — drops before the device.
+    pub fn load_embedder(&self, model_path: &str, gpu_layers: u32, n_ctx: u32) -> Result<EmbedderModel<'_>> {
         let model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers); // FRAGILE
         let model = LlamaModel::load_from_file(&self.rt, model_path, &model_params) // FRAGILE
             .with_context(|| format!("failed to load embedder model from {model_path}"))?;
-        let model: &'static LlamaModel = Box::leak(Box::new(model)); // process-lifetime; see above
+        Ok(EmbedderModel { rt: &self.rt, model, n_ctx })
+    }
+}
+
+impl EmbedderModel<'_> {
+    /// Embedding dimension (harrier: 640).
+    #[allow(dead_code)] // smoke-test only
+    pub fn dim(&self) -> usize {
+        self.model.n_embd() as usize
+    }
+
+    /// Open a short-lived LAST-token-pooling embeddings context borrowing this model. Transient (a
+    /// local in `embed_all`/`embed_one`), never stored — so there's no self-referential struct.
+    fn context(&self) -> Result<Embedder<'_>> {
         let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(n_ctx)) // FRAGILE: Option<NonZeroU32>
-            .with_n_batch(n_ctx) // a whole text embeds in one decode
+            .with_n_ctx(NonZeroU32::new(self.n_ctx)) // FRAGILE: Option<NonZeroU32>
+            .with_n_batch(self.n_ctx) // a whole text embeds in one decode
             .with_embeddings(true) // FRAGILE: turns on embedding extraction
             // LAST-token pooling — verified empirically as harrier's correct pooling (matches the
             // model card; Mean/Cls invert or degenerate). FRAGILE.
             .with_pooling_type(LlamaPoolingType::Last);
-        let ctx = model
-            .new_context(&self.rt, ctx_params) // FRAGILE: new_context (rt not tied to ctx lifetime)
+        let ctx = self
+            .model
+            .new_context(self.rt, ctx_params) // FRAGILE: new_context (rt not tied to ctx lifetime)
             .context("embedder new_context failed")?;
-        let n_embd = model.n_embd() as usize;
         Ok(Embedder {
-            model,
+            model: &self.model,
             ctx,
-            batch: LlamaBatch::new(n_ctx as usize, 1),
-            cap: n_ctx as usize,
-            n_embd,
+            batch: LlamaBatch::new(self.n_ctx as usize, 1),
+            cap: self.n_ctx as usize,
         })
     }
-}
 
-/// An embeddings session: feeds a text through the model and reads its pooled, L2-normalized vector.
-/// Owns everything (the model handle is leaked `'static`), so it moves freely into a closure.
-pub struct Embedder {
-    #[allow(dead_code)] // held so the leaked model's lifetime intent is explicit; ctx uses it
-    model: &'static LlamaModel,
-    ctx: LlamaContext<'static>,
-    batch: LlamaBatch<'static>,
-    cap: usize,
-    #[allow(dead_code)] // read by dim(), which only the smoke test calls
-    n_embd: usize,
-}
-
-impl Embedder {
-    /// Embedding dimension (harrier: 640).
-    #[allow(dead_code)] // smoke-test only
-    pub fn dim(&self) -> usize {
-        self.n_embd
+    /// Embed every text through ONE context (the corpus-indexing path). Each is an independent sequence.
+    pub fn embed_all(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let mut e = self.context()?;
+        texts.iter().map(|t| e.embed(t)).collect()
     }
 
+    /// Embed a single text through a transient context (the per-query path; queries are sparse).
+    pub fn embed_one(&self, text: &str) -> Result<Vec<f32>> {
+        self.context()?.embed(text)
+    }
+}
+
+/// A short-lived embeddings context (a transient local inside `EmbedderModel`'s methods, never
+/// stored). Feeds a text through the model and reads its pooled, L2-normalized vector.
+struct Embedder<'a> {
+    model: &'a LlamaModel,
+    ctx: LlamaContext<'a>,
+    batch: LlamaBatch<'a>,
+    cap: usize,
+}
+
+impl Embedder<'_> {
     /// Embed `text` → an L2-normalized vector (so cosine similarity == dot product). Each call is an
     /// independent sequence: clear seq 0, decode the whole text in one batch, read the pooled (last-
     /// token) embedding. The caller applies harrier's query instruction prefix when embedding a query.
-    pub fn embed(&mut self, text: &str) -> Result<Vec<f32>> {
+    fn embed(&mut self, text: &str) -> Result<Vec<f32>> {
         let mut toks = self.model.str_to_token(text, AddBos::Always)?; // FRAGILE: BOS like gemma chat
         toks.truncate(self.cap); // never exceed the context/batch (chunks are short; this is a guard)
         self.ctx.clear_kv_cache_seq(Some(0), None, None)?; // each embed is a fresh sequence
@@ -242,15 +267,15 @@ mod tests {
     fn embedder_smoke() {
         let backend =
             LlamaBackend::load("models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf", 999, false).unwrap();
-        let mut e = backend
+        let em = backend
             .load_embedder("models/harrier-oss-v1-270m-BF16.gguf", 999, 2048)
             .unwrap();
-        assert_eq!(e.dim(), 640, "harrier embedding dimension");
+        assert_eq!(em.dim(), 640, "harrier embedding dimension");
 
         let instruct = "Instruct: Given a search query, retrieve relevant passages.\nQuery: ";
-        let query = e.embed(&format!("{instruct}a dog barking in the yard")).unwrap();
-        let related = e.embed("The puppy wagged its tail and barked loudly.").unwrap();
-        let unrelated = e.embed("The Boeing 747 taxied slowly down the runway.").unwrap();
+        let query = em.embed_one(&format!("{instruct}a dog barking in the yard")).unwrap();
+        let related = em.embed_one("The puppy wagged its tail and barked loudly.").unwrap();
+        let unrelated = em.embed_one("The Boeing 747 taxied slowly down the runway.").unwrap();
         let cos = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
         let (near, far) = (cos(&query, &related), cos(&query, &unrelated));
         eprintln!("cos(q,related)={near:.4}  cos(q,unrelated)={far:.4}  gap={:.4}", near - far);

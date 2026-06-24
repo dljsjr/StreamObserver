@@ -9,7 +9,8 @@ use std::collections::HashMap;
 /// The `--rag` retrieval seam: a query string → the best matching corpus snippet (or `None`). Built
 /// once (`main::build_retriever`) as a closure that closes over the BM25/semantic indexes (+ embedder),
 /// then threaded to `Lobe::step` / `handle_rag`. `FnMut` because the semantic path mutates the embedder.
-pub type RetrieveFn = dyn FnMut(&str) -> Option<String>;
+/// The `'a` lifetime ties it to the embedder's borrow of the runtime (the closure isn't `'static`).
+pub type RetrieveFn<'a> = dyn FnMut(&str) -> Option<String> + 'a;
 
 /// BM25 parameters (the standard defaults): term-frequency saturation and length normalization.
 const K1: f32 = 1.5;

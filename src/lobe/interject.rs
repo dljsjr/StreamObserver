@@ -337,7 +337,9 @@ impl<B: Backend> Lobe<'_, B> {
             Some(s) if !s.trim().is_empty() => format!(
                 "\n\nSomething here stirs a memory — elsewhere the text says:\n\u{201c}{}\u{201d}\nLet it \
                  colour your reflection if it resonates.",
-                s.trim()
+                // Trim the retrieved chunk to a punchy quote (it's ~80 words); a word-aligned ~240-char
+                // head keeps the ask lean (the recall is a prompt, not the whole passage).
+                trim_snippet(s.trim(), 240)
             ),
             _ => String::new(),
         };
