@@ -53,13 +53,21 @@ const VIG_MAX_DIM: f32 = 0.55; // vignette: max brightness cut at the darkest ed
 /// (Werner stands reading in front of his chair; his head is centered at col 64 of the 100-wide room.)
 const HEAD_COL: u16 = 64;
 
-pub fn run(lobe: &mut Lobe, cli: &Cli, input_path: &str, tick_ms: u64, skip_to: &str) -> Result<()> {
+pub fn run(
+    lobe: &mut Lobe,
+    cli: &Cli,
+    input_path: &str,
+    tick_ms: u64,
+    skip_to: &str,
+    retrieve: &mut dyn FnMut(&str) -> Option<String>,
+) -> Result<()> {
     // Parse the scene + flame animation once, up front, so a malformed asset fails loudly before
     // entering raw mode.
     let scene = Sprite::from_json(STUDY_JSON)?;
     let fire = Anim::from_json(FIRE_JSON)?;
 
     let interject = cli.interject_on();
+    let rag = cli.rag;
     let interject_max = cli.interject_max;
     let mut raw = std::fs::read_to_string(input_path)?;
     if !skip_to.is_empty() {
@@ -138,7 +146,9 @@ pub fn run(lobe: &mut Lobe, cli: &Cli, input_path: &str, tick_ms: u64, skip_to: 
             // One fused step per tick — COPIED from present.rs (identical pending/revealed/dedup logic);
             // only the display differs.
             if let Some(tok) = feed.next() {
-                let (s, status) = if interject {
+                // --rag uses the blocking retrieval pass (observe + serialized rag()); otherwise the
+                // fused interjection. Both end as `last_aside` (the speech bubble).
+                let (s, status) = if interject && !rag {
                     let out = lobe.step(tok, &mut stats, z, cli.topk, interject_max)?;
                     (out.step, Some(out.interjection))
                 } else {
@@ -154,9 +164,14 @@ pub fn run(lobe: &mut Lobe, cli: &Cli, input_path: &str, tick_ms: u64, skip_to: 
                     prose.drain(0..cut);
                 }
 
-                // The dedup/reveal policy lives in the lobe; we render `pending`/`revealed` and store
-                // whatever survives.
-                if let Some(text) = lobe.advance_reveal(status, &mut pending, &mut revealed)? {
+                if rag {
+                    if let Some(t) = &s.trigger {
+                        let (aside, _snippet) =
+                            crate::rag_aside(lobe, &t.token_text, interject_max, retrieve)?;
+                        last_aside = Some(aside);
+                    }
+                } else if let Some(text) = lobe.advance_reveal(status, &mut pending, &mut revealed)? {
+                    // The dedup/reveal policy lives in the lobe; we just store whatever survives.
                     last_aside = Some(text);
                 }
             } else {

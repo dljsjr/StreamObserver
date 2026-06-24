@@ -213,6 +213,25 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     non_deterministic: bool,
 
+    /// #8 RAG: on each fire, run the native tool-calling retrieval pass instead of the free-association
+    /// aside — the observer thinks, (maybe) calls `search`, and grounds its reply in the hit. Works in
+    /// every mode (headless emits JSONL; tui/present show the grounded aside). In a live mode the
+    /// retrieval pass blocks the stream briefly (serialized). Headless: mutually exclusive with --fused.
+    #[arg(long, default_value_t = false)]
+    rag: bool,
+
+    /// Corpus text file the `search` tool retrieves over (#8) — the "external knowledge base", e.g. the
+    /// novel being read. Set → retrieval is real (BM25) and hits feed back into a grounded aside; unset
+    /// → retrieval finds nothing (just the thought).
+    #[arg(long)]
+    rag_corpus: Option<String>,
+
+    /// Embedding-model GGUF (e.g. harrier-oss-v1-270m). With `--rag-corpus`, retrieval becomes HYBRID:
+    /// BM25 and semantic-cosine rankings fused by Reciprocal Rank Fusion (k=60). Requires the llama
+    /// backend; embeds the corpus once at startup.
+    #[arg(long)]
+    rag_embed_model: Option<String>,
+
     #[command(subcommand)]
     mode: Mode,
 }
@@ -237,23 +256,6 @@ enum Mode {
         /// `trigger` events — so an offline threshold sweep gets a complete per-token stream.
         #[arg(long, default_value_t = false)]
         all_steps: bool,
-
-        /// On each trigger, probe the native tool-calling RAG hook (#8): define a `search` tool and
-        /// let the observer think + (maybe) call it. Emits a `rag_probe` event with the RAW output.
-        #[arg(long, default_value_t = false)]
-        rag: bool,
-
-        /// Corpus text file to retrieve over (#8): the "external knowledge base" a `search` tool call
-        /// is answered from (e.g. the novel being read). When set, retrieval is REAL (BM25 over the
-        /// file) and the model's hits feed back into a grounded aside; unset → retrieval finds nothing.
-        #[arg(long)]
-        rag_corpus: Option<String>,
-
-        /// Embedding-model GGUF for SEMANTIC retrieval over `--rag-corpus` (e.g. harrier-oss-v1-270m).
-        /// When set, corpus chunks + queries are embedded (last-token pooling) and ranked by cosine
-        /// instead of BM25 — better on paraphrase/concept queries. Requires the llama backend.
-        #[arg(long)]
-        rag_embed_model: Option<String>,
 
         /// Use the FUSED concurrent forward pass (CONCURRENT_FORWARD_PASS): observation and
         /// interjection generation co-batch into one decode per stream token, so observation never
@@ -413,42 +415,38 @@ fn main() -> Result<()> {
     let preamble_tokens = lobe.tokenize(&preamble_text, true)?;
     lobe.prime(&preamble_tokens)?;
 
+    // Build the retrieval function ONCE (it's the mode-agnostic `--rag` seam): HYBRID RRF (embed model
+    // + corpus) > LEXICAL BM25 (corpus only) > none. Every mode gets it; in a live mode the per-fire
+    // retrieval pass blocks the stream briefly (serialized with the fused forward pass — by design).
+    let corpus_text = match &cli.rag_corpus {
+        Some(path) => Some(
+            std::fs::read_to_string(path)
+                .with_context(|| format!("failed to read --rag-corpus {path}"))?,
+        ),
+        None => None,
+    };
+    let mut retrieve = build_retriever(&engine, corpus_text.as_deref(), &cli.rag_embed_model)?;
+
     // Borrow `cli.mode` rather than moving out of it — the handlers also take `&cli`, so a
     // partial move of `cli.mode` (the non-Copy `input: String`) would invalidate that borrow.
     match &cli.mode {
         Mode::Headless {
             granularity,
             all_steps,
-            rag,
-            rag_corpus,
-            rag_embed_model,
             fused,
-        } => {
-            // Build the retrieval function once: SEMANTIC (embed model + corpus) > LEXICAL BM25
-            // (corpus only) > none. It's the `--rag` seam — `handle_rag` calls it with each query.
-            let corpus_text = match rag_corpus {
-                Some(path) => Some(
-                    std::fs::read_to_string(path)
-                        .with_context(|| format!("failed to read --rag-corpus {path}"))?,
-                ),
-                None => None,
-            };
-            let mut retrieve = build_retriever(&engine, corpus_text.as_deref(), rag_embed_model)?;
-            run_headless(
-                &mut lobe,
-                &cli,
-                *granularity,
-                *all_steps,
-                *rag,
-                *fused,
-                retrieve.as_mut(),
-            )
-        }
+        } => run_headless(
+            &mut lobe,
+            &cli,
+            *granularity,
+            *all_steps,
+            *fused,
+            retrieve.as_mut(),
+        ),
         Mode::Tui {
             input,
             tick_ms,
             skip_to,
-        } => tui::run(&mut lobe, &cli, input, *tick_ms, skip_to),
+        } => tui::run(&mut lobe, &cli, input, *tick_ms, skip_to, retrieve.as_mut()),
         Mode::Present {
             input,
             tick_ms,
@@ -456,9 +454,9 @@ fn main() -> Result<()> {
             scene,
         } => {
             if *scene {
-                present_scene::run(&mut lobe, &cli, input, *tick_ms, skip_to)
+                present_scene::run(&mut lobe, &cli, input, *tick_ms, skip_to, retrieve.as_mut())
             } else {
-                present::run(&mut lobe, &cli, input, *tick_ms, skip_to)
+                present::run(&mut lobe, &cli, input, *tick_ms, skip_to, retrieve.as_mut())
             }
         }
     }
@@ -620,6 +618,24 @@ fn handle_interjection(
     record_and_emit_interjection(lobe, stream_index, surprising, note.trim(), out)
 }
 
+/// Run the blocking #8 RAG pass for a fire (used by the live frontends when `--rag` is on — it
+/// serializes with the stream) and return the aside to display: the grounded reply when retrieval
+/// hit, else the free thought. Also returns the retrieved snippet (for frontends that surface it).
+pub(crate) fn rag_aside(
+    lobe: &mut Lobe,
+    surprising: &str,
+    max: usize,
+    retrieve: &mut dyn FnMut(&str) -> Option<String>,
+) -> Result<(String, Option<String>)> {
+    let out = lobe.rag(surprising, max, |_source, query| retrieve(query))?;
+    let aside = out
+        .response
+        .filter(|r| !r.is_empty())
+        .unwrap_or(out.thought);
+    lobe.record_interjection(&aside); // keep the novelty memory populated across fires
+    Ok((aside, out.retrieved))
+}
+
 /// The harrier query instruction (#8 semantic retrieval). harrier needs a one-sentence task
 /// instruction prepended to QUERIES (not documents); format is its native `Instruct: …\nQuery: …`.
 const RAG_INSTRUCT: &str = "Instruct: Given a search query, retrieve relevant passages.\nQuery: ";
@@ -715,11 +731,11 @@ fn run_headless(
     cli: &Cli,
     granularity: Granularity,
     all_steps: bool,
-    rag: bool,
     fused: bool,
     retrieve: &mut dyn FnMut(&str) -> Option<String>,
 ) -> Result<()> {
     let interject = cli.interject_on(); // global flag (on by default; --no-interject disables)
+    let rag = cli.rag;
     let mut stats = Welford::new(cli.warmup, cli.adapt);
     let signal_name = match cli.signal {
         Signal::Surprisal => "surprisal",
