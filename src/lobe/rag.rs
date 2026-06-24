@@ -40,11 +40,11 @@ impl<B: Backend> Lobe<'_, B> {
     /// No grammar — the modal think→call structure is the model's own. Generation renders special
     /// tokens as text (`detok`, not `detok_gen`) so the `<|tool_call>…<tool_call|>` markers survive for
     /// parsing. Snippet-based (uses the recent window); stops at the model's turn-close after the call.
-    pub fn rag<F: Fn(Source, &str) -> Option<String>>(
+    pub fn rag<F: FnMut(Source, &str) -> Option<String>>(
         &mut self,
         surprising: &str,
         max: usize,
-        retrieve: F,
+        mut retrieve: F,
     ) -> Result<RagOutcome> {
         self.session.clear_seq(GEN_SEQ as u32)?;
         let recent: String = self.recent.iter().map(String::as_str).collect();

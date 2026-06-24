@@ -9,7 +9,7 @@
 use anyhow::{Context, Result};
 use std::num::NonZeroU32;
 
-use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::params::{LlamaContextParams, LlamaPoolingType};
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend as LlamaRuntime;
 use llama_cpp_2::llama_batch::LlamaBatch;
@@ -141,5 +141,119 @@ impl Session for LlamaSession<'_> {
 
     fn seq_pos_max(&self, seq: u32) -> i32 {
         self.ctx.kv_cache_seq_pos_max(seq as i32) // FRAGILE: = llama_kv_cache_seq_pos_max
+    }
+}
+
+// --- Embedding model (#8 semantic retrieval) -------------------------------------------------------
+// A SECOND model (harrier-oss-v1-270m, a gemma3-arch embedding model) loaded into the SAME runtime as
+// the main model — `LlamaBackend::init()` guards double-init, so the embedder must share it. Lives
+// behind the llama feature; `main` uses it only when `--rag-embed-model` is given.
+
+impl LlamaBackend {
+    /// Load an embedding model into this backend's runtime and open a LAST-token-pooling embeddings
+    /// context. The model handle is leaked to `'static`: it's a process-lifetime resource (loaded once,
+    /// used till exit — like the main model), and leaking lets the returned `Embedder` own its context
+    /// without a self-referential struct or threaded lifetimes. Sound because the runtime (this
+    /// backend) outlives the run; `'static` here means "as long as the process", which it is.
+    pub fn load_embedder(&self, model_path: &str, gpu_layers: u32, n_ctx: u32) -> Result<Embedder> {
+        let model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers); // FRAGILE
+        let model = LlamaModel::load_from_file(&self.rt, model_path, &model_params) // FRAGILE
+            .with_context(|| format!("failed to load embedder model from {model_path}"))?;
+        let model: &'static LlamaModel = Box::leak(Box::new(model)); // process-lifetime; see above
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(n_ctx)) // FRAGILE: Option<NonZeroU32>
+            .with_n_batch(n_ctx) // a whole text embeds in one decode
+            .with_embeddings(true) // FRAGILE: turns on embedding extraction
+            // LAST-token pooling — verified empirically as harrier's correct pooling (matches the
+            // model card; Mean/Cls invert or degenerate). FRAGILE.
+            .with_pooling_type(LlamaPoolingType::Last);
+        let ctx = model
+            .new_context(&self.rt, ctx_params) // FRAGILE: new_context (rt not tied to ctx lifetime)
+            .context("embedder new_context failed")?;
+        let n_embd = model.n_embd() as usize;
+        Ok(Embedder {
+            model,
+            ctx,
+            batch: LlamaBatch::new(n_ctx as usize, 1),
+            cap: n_ctx as usize,
+            n_embd,
+        })
+    }
+}
+
+/// An embeddings session: feeds a text through the model and reads its pooled, L2-normalized vector.
+/// Owns everything (the model handle is leaked `'static`), so it moves freely into a closure.
+pub struct Embedder {
+    #[allow(dead_code)] // held so the leaked model's lifetime intent is explicit; ctx uses it
+    model: &'static LlamaModel,
+    ctx: LlamaContext<'static>,
+    batch: LlamaBatch<'static>,
+    cap: usize,
+    #[allow(dead_code)] // read by dim(), which only the smoke test calls
+    n_embd: usize,
+}
+
+impl Embedder {
+    /// Embedding dimension (harrier: 640).
+    #[allow(dead_code)] // smoke-test only
+    pub fn dim(&self) -> usize {
+        self.n_embd
+    }
+
+    /// Embed `text` → an L2-normalized vector (so cosine similarity == dot product). Each call is an
+    /// independent sequence: clear seq 0, decode the whole text in one batch, read the pooled (last-
+    /// token) embedding. The caller applies harrier's query instruction prefix when embedding a query.
+    pub fn embed(&mut self, text: &str) -> Result<Vec<f32>> {
+        let mut toks = self.model.str_to_token(text, AddBos::Always)?; // FRAGILE: BOS like gemma chat
+        toks.truncate(self.cap); // never exceed the context/batch (chunks are short; this is a guard)
+        self.ctx.clear_kv_cache_seq(Some(0), None, None)?; // each embed is a fresh sequence
+        self.batch.clear();
+        let last = toks.len().saturating_sub(1);
+        for (i, t) in toks.iter().enumerate() {
+            // logits on every token: pooling reads them; for LAST pooling the final one is decisive.
+            self.batch.add(*t, i as i32, &[0], i == last)?; // FRAGILE: add(token,pos,seqs,logits)
+        }
+        self.ctx.decode(&mut self.batch)?; // FRAGILE: decode
+        let mut v = self.ctx.embeddings_seq_ith(0)?.to_vec(); // FRAGILE: pooled seq embedding
+        l2_normalize(&mut v);
+        Ok(v)
+    }
+}
+
+/// L2-normalize in place (harrier embeddings are L2-normalized; cosine then reduces to a dot product).
+fn l2_normalize(v: &mut [f32]) {
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for x in v {
+            *x /= norm;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Smoke-test the real harrier GGUF: 640-dim, and a related passage out-scores an unrelated one.
+    /// `#[ignore]` — loads models from disk (Qwen as the throwaway main model, harrier as the
+    /// embedder); run manually: `cargo test --features metal -- --ignored embedder_smoke --nocapture`.
+    #[test]
+    #[ignore = "loads real GGUFs from models/; run manually"]
+    fn embedder_smoke() {
+        let backend =
+            LlamaBackend::load("models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf", 999, false).unwrap();
+        let mut e = backend
+            .load_embedder("models/harrier-oss-v1-270m-BF16.gguf", 999, 2048)
+            .unwrap();
+        assert_eq!(e.dim(), 640, "harrier embedding dimension");
+
+        let instruct = "Instruct: Given a search query, retrieve relevant passages.\nQuery: ";
+        let query = e.embed(&format!("{instruct}a dog barking in the yard")).unwrap();
+        let related = e.embed("The puppy wagged its tail and barked loudly.").unwrap();
+        let unrelated = e.embed("The Boeing 747 taxied slowly down the runway.").unwrap();
+        let cos = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+        let (near, far) = (cos(&query, &related), cos(&query, &unrelated));
+        eprintln!("cos(q,related)={near:.4}  cos(q,unrelated)={far:.4}  gap={:.4}", near - far);
+        assert!(near - far > 0.1, "related must clearly out-score unrelated (LAST pooling)");
     }
 }

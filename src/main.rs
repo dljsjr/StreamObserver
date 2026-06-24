@@ -249,6 +249,12 @@ enum Mode {
         #[arg(long)]
         rag_corpus: Option<String>,
 
+        /// Embedding-model GGUF for SEMANTIC retrieval over `--rag-corpus` (e.g. harrier-oss-v1-270m).
+        /// When set, corpus chunks + queries are embedded (last-token pooling) and ranked by cosine
+        /// instead of BM25 — better on paraphrase/concept queries. Requires the llama backend.
+        #[arg(long)]
+        rag_embed_model: Option<String>,
+
         /// Use the FUSED concurrent forward pass (CONCURRENT_FORWARD_PASS): observation and
         /// interjection generation co-batch into one decode per stream token, so observation never
         /// stalls (the interjection forms in the background and emits ~N tokens after its trigger).
@@ -415,17 +421,19 @@ fn main() -> Result<()> {
             all_steps,
             rag,
             rag_corpus,
+            rag_embed_model,
             fused,
         } => {
-            // Build the retrieval index once (BM25 over the corpus file) if --rag-corpus was given.
-            let corpus = match rag_corpus {
-                Some(path) => Some(retrieval::index(
-                    &std::fs::read_to_string(path)
+            // Build the retrieval function once: SEMANTIC (embed model + corpus) > LEXICAL BM25
+            // (corpus only) > none. It's the `--rag` seam — `handle_rag` calls it with each query.
+            let corpus_text = match rag_corpus {
+                Some(path) => Some(
+                    std::fs::read_to_string(path)
                         .with_context(|| format!("failed to read --rag-corpus {path}"))?,
-                    80, // ~80-word chunks: a readable passage, small enough to localize a hit
-                )),
+                ),
                 None => None,
             };
+            let mut retrieve = build_retriever(&engine, corpus_text.as_deref(), rag_embed_model)?;
             run_headless(
                 &mut lobe,
                 &cli,
@@ -433,7 +441,7 @@ fn main() -> Result<()> {
                 *all_steps,
                 *rag,
                 *fused,
-                corpus.as_ref(),
+                retrieve.as_mut(),
             )
         }
         Mode::Tui {
@@ -553,7 +561,7 @@ fn process_observe_token(
     interject: bool,
     rag: bool,
     all_steps: bool,
-    corpus: Option<&retrieval::Corpus>,
+    retrieve: &mut dyn FnMut(&str) -> Option<String>,
     out: &mut impl Write,
 ) -> Result<bool> {
     let step = lobe.observe(tok, stats, cli.z, cli.topk)?;
@@ -568,7 +576,7 @@ fn process_observe_token(
             handle_interjection(lobe, stream_index, &surprising, cli.interject_max, out)?;
         }
         if rag {
-            handle_rag(lobe, stream_index, &surprising, corpus, out)?;
+            handle_rag(lobe, stream_index, &surprising, retrieve, out)?;
         }
     }
 
@@ -612,20 +620,71 @@ fn handle_interjection(
     record_and_emit_interjection(lobe, stream_index, surprising, note.trim(), out)
 }
 
-/// #8 native tool-calling RAG pass for a fire: the free thought is emitted as an `interjection`, and
-/// a parsed tool call drives a `retrieval` event answered by BM25 over the `--rag-corpus` (or nothing
-/// when no corpus was given). Abstain → no retrieval, just the thought.
+/// The harrier query instruction (#8 semantic retrieval). harrier needs a one-sentence task
+/// instruction prepended to QUERIES (not documents); format is its native `Instruct: …\nQuery: …`.
+const RAG_INSTRUCT: &str = "Instruct: Given a search query, retrieve relevant passages.\nQuery: ";
+
+/// Reciprocal Rank Fusion constant (the canonical default).
+const RRF_K: f32 = 60.0;
+
+/// Build the `--rag` retrieval function (the seam `handle_rag` calls per query): HYBRID RRF (embed
+/// model + corpus: fuse BM25 and semantic rankings) > LEXICAL BM25 (corpus only) > none. The embedder
+/// owns a leaked `'static` model, so the returned closure is self-contained.
+fn build_retriever(
+    engine: &ActiveBackend,
+    corpus_text: Option<&str>,
+    rag_embed_model: &Option<String>,
+) -> Result<Box<dyn FnMut(&str) -> Option<String>>> {
+    const CHUNK_WORDS: usize = 80;
+    match (corpus_text, rag_embed_model) {
+        (Some(text), Some(embed_path)) => {
+            #[cfg(feature = "llama")]
+            {
+                // One chunking shared by both indexes (RRF fuses by chunk index, so they must align).
+                let chunks = retrieval::chunk(text, CHUNK_WORDS);
+                let mut embedder = engine.load_embedder(embed_path, 999, 2048)?;
+                eprintln!("[lobe] embedding {} corpus chunks for hybrid retrieval…", chunks.len());
+                let embeddings = chunks
+                    .iter()
+                    .map(|c| embedder.embed(c))
+                    .collect::<Result<Vec<_>>>()?;
+                let corpus = retrieval::index_chunks(chunks); // moves chunks (embeddings already built)
+                let semantic = retrieval::SemanticIndex::new(embeddings);
+                Ok(Box::new(move |q: &str| {
+                    // Fuse BM25 (lexical) + semantic rankings with RRF — keeps both signals (exact-term
+                    // hits AND paraphrase/concept matches) without normalizing their disparate scores.
+                    let bm = retrieval::rank_bm25(&corpus, q);
+                    let qe = embedder.embed(&format!("{RAG_INSTRUCT}{q}")).ok()?;
+                    let sem = retrieval::rank_semantic(&semantic, &qe);
+                    retrieval::rrf_best(&[&bm, &sem], RRF_K).map(|i| corpus.chunk_text(i).to_string())
+                }))
+            }
+            #[cfg(not(feature = "llama"))]
+            {
+                let _ = (text, embed_path, engine);
+                anyhow::bail!("--rag-embed-model requires the llama backend")
+            }
+        }
+        (Some(text), None) => {
+            let corpus = retrieval::index(text, CHUNK_WORDS);
+            Ok(Box::new(move |q: &str| retrieval::search(&corpus, q)))
+        }
+        _ => Ok(Box::new(|_q: &str| None)),
+    }
+}
+
+/// #8 native tool-calling RAG pass for a fire: the free thought is emitted as an `interjection`, the
+/// parsed tool call is answered by `retrieve` (semantic or BM25 over `--rag-corpus`, or nothing), and
+/// the grounded reply (after the snippet is fed back) is emitted as a second interjection.
 fn handle_rag(
     lobe: &mut Lobe,
     stream_index: usize,
     surprising: &str,
-    corpus: Option<&retrieval::Corpus>,
+    retrieve: &mut dyn FnMut(&str) -> Option<String>,
     out: &mut impl Write,
 ) -> Result<()> {
-    // Retrieval is injected as a function argument (the `--rag-corpus` BM25 index, or nothing).
-    let rag_out = lobe.rag(surprising, 160, |_source, query| {
-        corpus.and_then(|c| retrieval::search(c, query))
-    })?;
+    // Retrieval is injected as a function argument (the pre-built `--rag` retriever).
+    let rag_out = lobe.rag(surprising, 160, |_source, query| retrieve(query))?;
     record_and_emit_interjection(lobe, stream_index, surprising, rag_out.thought.trim(), out)?;
     if let Some(d) = &rag_out.directive {
         let src = match d.source {
@@ -658,7 +717,7 @@ fn run_headless(
     all_steps: bool,
     rag: bool,
     fused: bool,
-    corpus: Option<&retrieval::Corpus>,
+    retrieve: &mut dyn FnMut(&str) -> Option<String>,
 ) -> Result<()> {
     let interject = cli.interject_on(); // global flag (on by default; --no-interject disables)
     let mut stats = Welford::new(cli.warmup, cli.adapt);
@@ -698,7 +757,7 @@ fn run_headless(
                     process_fused_token(lobe, tok, &mut stats, cli, signal_name, &mut out)?;
                 } else {
                     let fired = process_observe_token(
-                        lobe, tok, &mut stats, cli, signal_name, interject, rag, all_steps, corpus,
+                        lobe, tok, &mut stats, cli, signal_name, interject, rag, all_steps, retrieve,
                         &mut out,
                     )?;
                     // Flush promptly on triggers so live consumers see them; plain steps stay buffered
