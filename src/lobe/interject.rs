@@ -62,6 +62,38 @@ pub enum InterjectStatus {
     Done(String),
 }
 
+/// How interjections are produced — the generation knobs, set once from the CLI. Pure config (no
+/// runtime state). Defaults are the converged config (Context mode, control experiment arms, the
+/// fixation-fixing sampling temp/top-p).
+pub(crate) struct InterjectConfig {
+    /// Whether interjections reflect on the full forked context or a re-encoded snippet.
+    pub mode: InterjectMode,
+    /// EXPERIMENT (templating study): context-mode ask framing (H2) + novelty framing (H4). Both
+    /// default to the control variant, so behavior is unchanged unless a flag is set.
+    pub ask_mode: AskMode,
+    pub novelty_mode: NoveltyMode,
+    /// Interjection sampling: temperature + top-p applied ONLY to interjection generation.
+    /// `temp <= 0` = greedy argmax. Observation scoring is always exact regardless.
+    pub temp: f32,
+    pub top_p: f32,
+    /// Max interjection length (tokens), used to size the cap+reset roll margin so an interjection's
+    /// full concurrent KV footprint (ask + generated tokens + seq-0 growth during gen) always fits.
+    pub max_hint: usize,
+}
+
+impl Default for InterjectConfig {
+    fn default() -> Self {
+        Self {
+            mode: InterjectMode::Context,
+            ask_mode: AskMode::Passage,   // control
+            novelty_mode: NoveltyMode::Fresh, // control
+            temp: 0.7,                    // the fixation fix (see Lobe::set_interject_sampling)
+            top_p: 0.95,
+            max_hint: 96,
+        }
+    }
+}
+
 impl Lobe<'_> {
     /// Fork seq 0 onto GEN_SEQ and prefill the interjection ask in ONE decode (the single
     /// per-interjection stall), then seed the fused gen cursors. Subsequent reply tokens co-batch in
@@ -69,7 +101,7 @@ impl Lobe<'_> {
     /// timesliced `InterjectState`.
     pub(crate) fn start_fused_interjection(&mut self, max: usize) -> Result<()> {
         self.session.clear_seq(GEN_SEQ as u32)?;
-        let (toks, start_pos) = match self.interject_mode {
+        let (toks, start_pos) = match self.icfg.mode {
             InterjectMode::Snippet => {
                 let p = self.interject_prompt_snippet();
                 (self.tokenize(&p, true)?, 0)
@@ -102,8 +134,8 @@ impl Lobe<'_> {
         let logits = self.decode_seq(&toks, start_pos, GEN_SEQ)?;
         let first = sample_topp(
             &logits,
-            self.interject_temp,
-            self.interject_top_p,
+            self.icfg.temp,
+            self.icfg.top_p,
             &mut self.rng_state,
         );
         self.gen_pos = start_pos + toks.len() as i32;
@@ -156,7 +188,7 @@ impl Lobe<'_> {
 
         // Novelty memory (H4). Off = omit it entirely; otherwise show the last 1–2 asides, with the
         // framing chosen by `novelty_mode` (Fresh = content novelty [control]; Form = form novelty).
-        let novelty_block = if self.novelty_mode == NoveltyMode::Off {
+        let novelty_block = if self.icfg.novelty_mode == NoveltyMode::Off {
             String::new()
         } else {
             let noted: String = self
@@ -172,7 +204,7 @@ impl Lobe<'_> {
             }
         };
         // The closing instruction's novelty clause depends on `novelty_mode`.
-        let novelty_clause = match self.novelty_mode {
+        let novelty_clause = match self.icfg.novelty_mode {
             NoveltyMode::Fresh => " — but find a fresh angle, not one you've already made", // control
             NoveltyMode::Form => " — but vary your rhythm and how you begin, not just the subject",
             NoveltyMode::Off => "",
@@ -183,7 +215,7 @@ impl Lobe<'_> {
             span,
             &novelty_block,
             novelty_clause,
-            self.ask_mode == AskMode::Continuous,
+            self.icfg.ask_mode == AskMode::Continuous,
         )
     }
 
@@ -216,10 +248,10 @@ impl Lobe<'_> {
     pub fn interject_begin(&mut self, surprising: &str, max: usize) -> Result<()> {
         let t_start = std::time::Instant::now();
         self.session.clear_seq(GEN_SEQ as u32)?;
-        let forked = matches!(self.interject_mode, InterjectMode::Context);
+        let forked = matches!(self.icfg.mode, InterjectMode::Context);
         // Build the EXACT prompt the model will see (raw model input), keeping the text for the
         // observability event. Context mode forks the live seq-0 KV first (cheap cell copy).
-        let prompt_text = match self.interject_mode {
+        let prompt_text = match self.icfg.mode {
             InterjectMode::Snippet => self.interject_prompt_snippet(),
             InterjectMode::Context => {
                 self.session.copy_seq(0, GEN_SEQ as u32)?;
@@ -231,7 +263,7 @@ impl Lobe<'_> {
 
         tracing::info!(
             target: "lobe::interject", kind = "interject_begin",
-            stream_index = self.stream_index as u64, mode = ?self.interject_mode, forked,
+            stream_index = self.stream_index as u64, mode = ?self.icfg.mode, forked,
             trigger_token = %surprising, start_pos = start_pos as i64,
             prompt_tokens = toks.len() as u64, max = max as u64,
             delta_span = %word_aligned(&self.memory.last_span).trim(),
@@ -301,8 +333,8 @@ impl Lobe<'_> {
                 // Interjection generation: temperature/top-p if configured (experiment), else greedy.
                 let tok = sample_topp(
                     &logits,
-                    self.interject_temp,
-                    self.interject_top_p,
+                    self.icfg.temp,
+                    self.icfg.top_p,
                     &mut self.rng_state,
                 );
                 // Stop at any turn boundary (is_eog alone misses gemma-4's <turn|>; <|turn> means

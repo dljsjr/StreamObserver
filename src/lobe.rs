@@ -122,7 +122,7 @@ pub use rag::Source;
 // (the `StepOutcome` field + the frontends) is re-exported. `InterjectStep` stays inside the module —
 // it only appears in `interject_step`'s signature there, with no external consumer.
 mod interject;
-use interject::InterjectState;
+use interject::{InterjectConfig, InterjectState};
 pub use interject::InterjectStatus;
 
 // Interjection anti-fixation memory (recent asides + delta span + dedup) lives in its own module —
@@ -224,22 +224,15 @@ pub struct Lobe<'a> {
     sot: Option<Token>,
     /// In-flight streaming interjection (pumped by `interject_step`); None when idle.
     interjection: Option<InterjectState>,
-    /// Whether interjections reflect on the full forked context or a re-encoded snippet.
-    interject_mode: InterjectMode,
-    /// EXPERIMENT (templating study): context-mode ask framing (H2) + novelty framing (H4). Both
-    /// default to the control variant, so behavior is unchanged unless a flag is set.
-    ask_mode: AskMode,
-    novelty_mode: NoveltyMode,
+    /// How interjections are produced (mode, experiment arms, sampling, length hint). Pure config;
+    /// see `interject::InterjectConfig`.
+    icfg: InterjectConfig,
     /// Interjection anti-fixation memory: recent asides (novelty memory) + the delta-since-last-fire
     /// span + the opt-in dedup backstop. Pure state (no session); see `novelty::InterjectionMemory`.
     memory: InterjectionMemory,
     /// Structured-observability detail level (`--debug-log`). Inert unless a tracing subscriber is
     /// installed (the `enabled!` guards skip all dump work otherwise).
     debug: crate::trace::DebugCfg,
-    /// Interjection sampling (experiment): temperature + top-p applied ONLY to interjection
-    /// generation. `temp <= 0` = greedy argmax (default). Observation scoring is always exact.
-    interject_temp: f32,
-    interject_top_p: f32,
     /// xorshift64 state for interjection sampling; constant-seeded so a run is reproducible.
     rng_state: u64,
     /// Independent xorshift64 state for the PROBABILISTIC firing decision (decorrelated from
@@ -265,9 +258,6 @@ pub struct Lobe<'a> {
     /// Interjection tokens produced so far, and the cap.
     gen_produced: usize,
     gen_max: usize,
-    /// Max interjection length (tokens), used to size the cap+reset roll margin so an interjection's
-    /// full concurrent KV footprint (ask + generated tokens + seq-0 growth during gen) always fits.
-    interject_max_hint: usize,
 }
 
 /// The outcome of `Lobe::fire_decision` — whether the token fired, plus the gate states for the
@@ -320,13 +310,9 @@ impl<'a> Lobe<'a> {
             eot,
             sot,
             interjection: None,
-            interject_mode: InterjectMode::Context,
-            ask_mode: AskMode::Passage, // control
-            novelty_mode: NoveltyMode::Fresh, // control
+            icfg: InterjectConfig::default(),
             memory: InterjectionMemory::default(),
             debug: crate::trace::DebugCfg::default(),
-            interject_temp: 0.7, // default: the fixation fix (see set_interject_sampling / main)
-            interject_top_p: 0.95,
             rng_state: 0x9E3779B97F4A7C15, // fixed seed → reproducible runs (overridden via set_seed)
             fire_rng: 0x2545F4914F6CDD1D, // independent trigger-RNG stream (re-seeded in set_seed)
             fire_softness: 0.0, // default: deterministic hard threshold (no stochastic firing)
@@ -336,7 +322,6 @@ impl<'a> Lobe<'a> {
             gen_out: String::new(),
             gen_produced: 0,
             gen_max: 0,
-            interject_max_hint: 96,
         })
     }
 
@@ -349,8 +334,8 @@ impl<'a> Lobe<'a> {
     /// Configure interjection sampling (experiment). `temp <= 0` = greedy (default). Applies ONLY to
     /// interjection generation; observation scoring is always exact greedy/argmax off real logits.
     pub fn set_interject_sampling(&mut self, temp: f32, top_p: f32) {
-        self.interject_temp = temp;
-        self.interject_top_p = top_p;
+        self.icfg.temp = temp;
+        self.icfg.top_p = top_p;
     }
 
     /// Re-seed BOTH RNG streams from one seed: the interjection sampler (`rng_state`) and the
@@ -424,7 +409,7 @@ impl<'a> Lobe<'a> {
 
     /// Hint for the max interjection length (tokens) — sizes the cap+reset roll margin (#6 / fused).
     pub fn set_interject_max_hint(&mut self, m: usize) {
-        self.interject_max_hint = m;
+        self.icfg.max_hint = m;
     }
 
     /// Cap+reset roll margin (FUSED_CACHE_GO_NOGO §4a): how far below `n_ctx` seq 0 must roll so that
@@ -433,7 +418,7 @@ impl<'a> Lobe<'a> {
     /// the generated tokens PLUS seq-0's growth during the (deferred-roll) generation. Sized to that
     /// peak so total occupancy never overruns; clamped so seq 0 still gets a usable window.
     fn roll_margin(&self) -> i32 {
-        let m = self.interject_max_hint as i32;
+        let m = self.icfg.max_hint as i32;
         // ask = span(≤128) + novelty(2·m) + framing(~128); + gen(m) + seq0-growth-during-gen(m).
         // Total above the fork ≈ 256 + 4·m; keep generous so the exact pre-fork check rarely fires.
         (MAX_SPAN_TOKENS as i32 + 128 + 5 * m)
@@ -502,14 +487,14 @@ impl<'a> Lobe<'a> {
 
     /// Choose how interjections see context: forked-full-context (`Context`) or snippet (#7 nuance).
     pub fn set_interject_mode(&mut self, mode: InterjectMode) {
-        self.interject_mode = mode;
+        self.icfg.mode = mode;
     }
 
     /// EXPERIMENT: set the context-mode ask framing (H2) and novelty framing (H4). Defaults are the
     /// control variants (`Passage` / `Fresh`); these only change behavior when set off-control.
     pub fn set_ask_mode(&mut self, ask: AskMode, novelty: NoveltyMode) {
-        self.ask_mode = ask;
-        self.novelty_mode = novelty;
+        self.icfg.ask_mode = ask;
+        self.icfg.novelty_mode = novelty;
     }
 
     /// Set the near-duplicate interjection suppression threshold (Jaccard word overlap; 0 = off).
@@ -912,7 +897,7 @@ impl<'a> Lobe<'a> {
         //    disturbed mid-stream). Margin is widened to cover the concurrent growth during an
         //    interjection: both seq 0 and GEN_SEQ add cells each tick (~2×interject_max + the ask),
         //    and a fire can land just under the threshold — so reserve for the whole interjection.
-        self.interject_max_hint = interject_max; // keep the roll margin sized to the actual cap
+        self.icfg.max_hint = interject_max; // keep the roll margin sized to the actual cap
         if self.evict == EvictMode::Reset && !self.gen_in_flight {
             let margin = self.roll_margin();
             if self.pos >= self.n_ctx - margin {
@@ -993,8 +978,8 @@ impl<'a> Lobe<'a> {
             let gen_logits: Vec<f32> = self.session.logits(gi).to_vec();
             let next = sample_topp(
                 &gen_logits,
-                self.interject_temp,
-                self.interject_top_p,
+                self.icfg.temp,
+                self.icfg.top_p,
                 &mut self.rng_state,
             );
             // Soft length cap: past `gen_max` (interject_max), stop at the next sentence boundary so
