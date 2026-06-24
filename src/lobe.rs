@@ -89,7 +89,18 @@ use window::StreamWindow;
 mod sampling;
 pub(crate) use sampling::{argmax, ends_sentence, next_unit_f32, sample_topp, word_aligned};
 
-// The observation engine (`observe`/`step` + firing + scoring + logit dumps) — a big `impl Lobe`.
+// The scoring functional-core: pure functions of a logit slice (surprisal/entropy/top-k).
+mod scoring;
+pub(crate) use scoring::{entropy_of, surprisal_of, top_k};
+
+// The fused forward pass: the imperative-shell boundary around the shared decode (Lane → logits).
+mod fused;
+
+// Shared test doubles (the mock Backend/Session) — compiled only under test.
+#[cfg(test)]
+mod testutil;
+
+// The observation engine (`observe`/`step` + firing + logit dumps) — a big `impl Lobe`.
 mod observe;
 
 // Backend abstraction (docs/BACKEND.md): the observer talks only to these traits + types, never to

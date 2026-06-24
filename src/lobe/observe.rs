@@ -6,7 +6,7 @@
 //! module is `impl Lobe` over them.
 
 use super::*;
-use crate::backend::{Backend, Session};
+use crate::backend::Backend;
 use anyhow::Result;
 
 /// The outcome of `Lobe::fire_decision` — whether the token fired, plus the gate states for the
@@ -37,59 +37,6 @@ impl<B: Backend> Lobe<'_, B> {
             self.memory.snapshot_span();
         }
         FireOutcome { fired, suppressed, in_refractory, gate }
-    }
-
-    /// -ln P(tok) under last_logits, via a stable log-sum-exp.
-    fn surprisal_of(&self, tok: Token) -> f32 {
-        let i = tok.0 as usize;
-        let logits = &self.last_logits;
-        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let mut sum = 0.0f32;
-        for &v in logits {
-            sum += (v - max).exp();
-        }
-        let logsumexp = max + sum.ln();
-        // -ln softmax[i] = logsumexp - logits[i]
-        logsumexp - logits[i]
-    }
-
-    /// Shannon entropy (nats) of the current next-token distribution: H = -Σ p ln p. High H
-    /// means the model is spread thin / uncertain at this position, regardless of which token
-    /// actually arrives. Computed via the same stable log-sum-exp as `surprisal_of`.
-    fn entropy_of(&self) -> f32 {
-        let logits = &self.last_logits;
-        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let mut sum = 0.0f32;
-        for &v in logits {
-            sum += (v - max).exp();
-        }
-        let logsumexp = max + sum.ln();
-        // p_i = exp(logit_i - logsumexp); -ln p_i = logsumexp - logit_i;  H = Σ p_i (-ln p_i).
-        let mut h = 0.0f32;
-        for &v in logits {
-            let p = (v - logsumexp).exp();
-            h += p * (logsumexp - v);
-        }
-        h
-    }
-
-    /// Top-k (text, probability) from last_logits, highest first.
-    fn top_k(&self, k: usize) -> Vec<(String, f32)> {
-        let logits = &self.last_logits;
-        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let mut sum = 0.0f32;
-        for &v in logits {
-            sum += (v - max).exp();
-        }
-        let mut idx: Vec<usize> = (0..logits.len()).collect();
-        idx.sort_unstable_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
-        idx.into_iter()
-            .take(k)
-            .map(|i| {
-                let p = ((logits[i] - max).exp()) / sum;
-                (self.detok(Token(i as i32)), p)
-            })
-            .collect()
     }
 
     /// Build a debug payload for a logit vector: summary stats (max, argmax, entropy) + top-K tokens
@@ -173,8 +120,8 @@ impl<B: Backend> Lobe<'_, B> {
         // Both metrics are read off the same distribution (the one that predicted `tok`):
         // surprisal = -ln P(tok); entropy = H of the whole distribution. We z-score whichever
         // signal is active and feed THAT to the baseline, but report both for inspection.
-        let surprisal = self.surprisal_of(tok);
-        let entropy = self.entropy_of();
+        let surprisal = surprisal_of(&self.last_logits, tok);
+        let entropy = entropy_of(&self.last_logits);
         let fire_value = match self.firing.signal {
             Signal::Surprisal => surprisal,
             Signal::Entropy => entropy,
@@ -192,7 +139,10 @@ impl<B: Backend> Lobe<'_, B> {
             self.fire_decision(&text, z, z_threshold, stats);
 
         let trigger = if fired {
-            let expected = self.top_k(topk);
+            let expected = top_k(&self.last_logits, topk)
+                .into_iter()
+                .map(|(id, p)| (self.detok(Token(id as i32)), p))
+                .collect();
             Some(Trigger {
                 stream_index: self.stream_index,
                 token_text: text.clone(),
@@ -316,8 +266,8 @@ impl<B: Backend> Lobe<'_, B> {
         }
 
         // 2. Score the stream token against the PRIOR distribution (last_logits) — exactly observe().
-        let surprisal = self.surprisal_of(stream_tok);
-        let entropy = self.entropy_of();
+        let surprisal = surprisal_of(&self.last_logits, stream_tok);
+        let entropy = entropy_of(&self.last_logits);
         let fire_value = match self.firing.signal {
             Signal::Surprisal => surprisal,
             Signal::Entropy => entropy,
@@ -332,7 +282,10 @@ impl<B: Backend> Lobe<'_, B> {
         // Shared firing decision (settle/refractory/gate/crossing + span capture) — see fire_decision.
         let fired = self.fire_decision(&text, z, z_threshold, stats).fired;
         let trigger = if fired {
-            let expected = self.top_k(topk);
+            let expected = top_k(&self.last_logits, topk)
+                .into_iter()
+                .map(|(id, p)| (self.detok(Token(id as i32)), p))
+                .collect();
             Some(Trigger {
                 stream_index: self.stream_index,
                 token_text: text.clone(),
@@ -350,66 +303,25 @@ impl<B: Backend> Lobe<'_, B> {
         let logit_dump = trig_on
             .then(|| self.logits_debug(&self.last_logits, self.debug.topk).to_string());
 
-        // 3. FUSED decode: stream token @ seq 0 (idx 0) + pending gen token @ GEN_SEQ (idx 1), both
-        //    with logits, in ONE pass. (One decode → both `logits(0)` and `logits(1)` available.)
-        let mut batch = vec![Decode {
-            token: stream_tok,
-            pos: self.pos,
-            seq: 0,
-            logits: true,
-        }];
-        let gen_idx = if self.gen.in_flight {
-            let t = self
-                .gen
-                .pending
-                .expect("gen_in_flight implies a pending token");
-            batch.push(Decode {
-                token: t,
-                pos: self.gen.pos,
-                seq: GEN_SEQ as u32,
-                logits: true,
-            });
-            Some(1usize)
-        } else {
-            None
-        };
-        self.session.decode(&batch)?;
-
-        // 3a. Observation: row 0 is the distribution after the stream token → next tick's last_logits.
-        self.last_logits.clear();
-        self.last_logits.extend_from_slice(self.session.logits(0));
-
-        // 3b. Generation: the token we just decoded (pending) is committed → emit it; sample the next.
-        let mut interjection = InterjectStatus::Idle;
-        if let Some(gi) = gen_idx {
-            let just = self.gen.pending.take().expect("gen_idx implies pending");
-            self.gen.out.push_str(&self.detok_gen(just));
-            self.gen.produced += 1;
-            self.gen.pos += 1;
-            let gen_logits: Vec<f32> = self.session.logits(gi).to_vec();
-            let next = sample_topp(
-                &gen_logits,
-                self.icfg.temp,
-                self.icfg.top_p,
-                &mut self.gen.rng,
-            );
-            // Soft length cap: past `gen_max` (interject_max), stop at the next sentence boundary so
-            // the aside never ends mid-clause; a hard ceiling (+SLACK) guards against runaway.
-            let stop = self.engine.is_eog(next)
-                || Some(next) == self.eot
-                || Some(next) == self.sot
-                || self.gen.produced >= self.gen.max + INTERJECT_SENTENCE_SLACK
-                || (self.gen.produced >= self.gen.max && ends_sentence(&self.gen.out));
-            if stop {
-                self.session.clear_seq(GEN_SEQ as u32)?;
-                self.gen.in_flight = false;
-                self.gen.produced = 0;
-                interjection = InterjectStatus::Done(std::mem::take(&mut self.gen.out));
-            } else {
-                self.gen.pending = Some(next);
-                interjection = InterjectStatus::Working(self.gen.out.clone());
-            }
+        // 3. FUSED decode (the imperative shell, `fused::decode_lanes`): the stream lane (seq 0) and,
+        //    if an interjection is in flight, the generation lane (GEN_SEQ) ride in ONE decode. The
+        //    lanes are the injected "token sources"; the per-lane logits come back for interpretation.
+        let mut lanes = vec![fused::Lane { token: stream_tok, pos: self.pos, seq: 0 }];
+        if self.gen.in_flight {
+            let pending = self.gen.pending.expect("gen_in_flight implies a pending token");
+            lanes.push(fused::Lane { token: pending, pos: self.gen.pos, seq: GEN_SEQ as u32 });
         }
+        let logits = fused::decode_lanes(&mut self.session, &lanes)?;
+
+        // 3a. Observation: lane 0's distribution becomes next tick's `last_logits`.
+        self.last_logits.clear();
+        self.last_logits.extend_from_slice(&logits[0]);
+
+        // 3b. Generation: if a gen lane rode along, advance it from its lane's logits (interject.rs).
+        let mut interjection = match logits.get(1) {
+            Some(gen_logits) => self.advance_fused_gen(gen_logits)?,
+            None => InterjectStatus::Idle,
+        };
 
         // 4. Advance seq 0 (mirrors decode_one's pos++ and observe's recent_id push).
         self.window.push_id(stream_tok);
@@ -458,87 +370,11 @@ impl<B: Backend> Lobe<'_, B> {
 
 #[cfg(test)]
 mod tests {
-    use crate::backend::{Backend, Decode, Detok, Session, SessionConfig, Token};
+    use crate::backend::Token;
+    use crate::lobe::testutil::MockBackend;
     use crate::lobe::{Lobe, LobeConfig};
     use crate::stats::Welford;
     use anyhow::Result;
-    use std::collections::HashMap;
-
-    /// A fake backend (the `Backend`/`Session` seam realized for tests): no model, no GPU. Its decode
-    /// always yields the same RAMP distribution `logit[i] = -i`, so surprisal grows smoothly and
-    /// predictably with the scored token's id — `surprisal(id) ≈ logsumexp + id`. That lets a test
-    /// warm the baseline with low-id tokens and then spike it with a high-id one to force a trigger.
-    struct MockBackend {
-        n_vocab: usize,
-    }
-
-    /// A fake session: tracks per-seq max position (for `seq_pos_max`/leak checks) and holds the last
-    /// decode's logits. The ramp is recomputed each decode; the input tokens only move the cursors.
-    struct MockSession<'a> {
-        backend: &'a MockBackend,
-        last: Vec<f32>,
-        seq_pos: HashMap<u32, i32>,
-    }
-
-    impl Backend for MockBackend {
-        type Session<'a>
-            = MockSession<'a>
-        where
-            Self: 'a;
-        fn load(_path: &str, _gpu_layers: u32, _verbose: bool) -> Result<Self> {
-            Ok(Self { n_vocab: 8 })
-        }
-        fn n_vocab(&self) -> usize {
-            self.n_vocab
-        }
-        fn tokenize(&self, text: &str, _add_bos: bool) -> Result<Vec<Token>> {
-            // Deterministic byte→id mapping; enough to prime a preamble in the cap+reset test.
-            Ok(text
-                .bytes()
-                .map(|b| Token((b as usize % self.n_vocab) as i32))
-                .collect())
-        }
-        fn detok(&self, token: Token, _mode: Detok) -> String {
-            format!("t{}", token.0)
-        }
-        fn is_eog(&self, _token: Token) -> bool {
-            false
-        }
-        fn special_token(&self, _text: &str) -> Option<Token> {
-            None
-        }
-        fn session(&self, _cfg: SessionConfig) -> Result<MockSession<'_>> {
-            Ok(MockSession {
-                backend: self,
-                last: Vec::new(),
-                seq_pos: HashMap::new(),
-            })
-        }
-    }
-
-    impl Session for MockSession<'_> {
-        fn decode(&mut self, batch: &[Decode]) -> Result<()> {
-            self.last = (0..self.backend.n_vocab).map(|i| -(i as f32)).collect();
-            for d in batch {
-                let e = self.seq_pos.entry(d.seq).or_insert(-1);
-                *e = (*e).max(d.pos);
-            }
-            Ok(())
-        }
-        fn logits(&self, _i: usize) -> &[f32] {
-            &self.last
-        }
-        fn clear_seq(&mut self, seq: u32) -> Result<()> {
-            self.seq_pos.insert(seq, -1);
-            Ok(())
-        }
-        fn copy_seq(&mut self, _src: u32, _dst: u32) -> Result<()> {
-            Ok(())
-        }
-        fn seq_pos_max(&self, seq: u32) -> i32 {
-            self.seq_pos.get(&seq).copied().unwrap_or(-1)
-        }
-    }
 
     // The very first stream token has no prior distribution to score against → a neutral step.
     #[test]

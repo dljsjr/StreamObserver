@@ -133,6 +133,37 @@ impl Default for GenState {
 }
 
 impl<B: Backend> Lobe<'_, B> {
+    /// Advance the in-flight FUSED interjection by one tick, given THIS tick's generation-lane logits
+    /// (the concurrent forward pass in `step` already produced them). Commits the token that was just
+    /// decoded, samples the next from the lane's logits, applies the soft/hard length cap, and returns
+    /// the interjection's status for this tick. The only impurity is dropping the scratch sequence on
+    /// stop; the sampling + stop test are functions of the logits + config. Lives here (the
+    /// interjection module) rather than inline in `step`, so the observation engine stays observation.
+    pub(crate) fn advance_fused_gen(&mut self, gen_logits: &[f32]) -> Result<InterjectStatus> {
+        // The token we co-batched last tick is now committed → emit it; then sample the next.
+        let just = self.gen.pending.take().expect("a gen lane implies a pending token");
+        self.gen.out.push_str(&self.detok_gen(just));
+        self.gen.produced += 1;
+        self.gen.pos += 1;
+        let next = sample_topp(gen_logits, self.icfg.temp, self.icfg.top_p, &mut self.gen.rng);
+        // Soft length cap: past `gen_max` (interject_max) stop at the next sentence boundary so the
+        // aside never ends mid-clause; a hard ceiling (+SLACK) guards against runaway.
+        let stop = self.engine.is_eog(next)
+            || Some(next) == self.eot
+            || Some(next) == self.sot
+            || self.gen.produced >= self.gen.max + INTERJECT_SENTENCE_SLACK
+            || (self.gen.produced >= self.gen.max && ends_sentence(&self.gen.out));
+        if stop {
+            self.session.clear_seq(GEN_SEQ as u32)?;
+            self.gen.in_flight = false;
+            self.gen.produced = 0;
+            Ok(InterjectStatus::Done(std::mem::take(&mut self.gen.out)))
+        } else {
+            self.gen.pending = Some(next);
+            Ok(InterjectStatus::Working(self.gen.out.clone()))
+        }
+    }
+
     /// Drive the streaming interjection-reveal state machine shared by the live frontends (tui /
     /// present / present-scene), so the dedup/reveal POLICY lives here, not duplicated in every UI.
     /// Given one tick's `InterjectStatus`, it buffers the opening as "thinking", aborts a doomed
