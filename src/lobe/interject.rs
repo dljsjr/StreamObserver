@@ -120,7 +120,7 @@ impl Lobe<'_> {
                 // ask + 2·(max+SLACK), using the HARD ceiling since the soft cap may overrun by SLACK.
                 // Roll now if that won't fit (no gen in flight while starting).
                 let gen_ceiling = (max + INTERJECT_SENTENCE_SLACK) as i32;
-                if self.evict == EvictMode::Reset
+                if self.window.evict == EvictMode::Reset
                     && self.pos + toks.len() as i32 + 2 * gen_ceiling + 32 > self.n_ctx
                 {
                     self.roll()?;

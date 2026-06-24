@@ -135,6 +135,11 @@ use novelty::InterjectionMemory;
 mod firing;
 use firing::Firing;
 
+// StreamingLLM cap+reset window (#6): pinned-prefix sink + rolling recent-id window + reset counters.
+// Owns the data + pure bookkeeping; `Lobe::roll`/`prime` do the session-side KV rebuild around it.
+mod window;
+use window::StreamWindow;
+
 // Backend abstraction (docs/BACKEND.md): the observer talks only to these traits + types, never to
 // a concrete inference engine. `ActiveBackend` is the cfg-selected impl (llama today, candle later).
 use crate::backend::{ActiveBackend, Backend, Decode, Detok, Session, SessionConfig, Token};
@@ -192,31 +197,12 @@ pub struct Lobe<'a> {
     /// Firing decision (#4): the trigger signal, identifier gate, refractory cooldown, stochastic-fire
     /// RNG + softness. Pure of inference state; see `firing::Firing`.
     firing: Firing,
-    // --- #6 cap + reset state ---
     /// Context size the cache was built with (positions 0..n_ctx-1 are valid).
     n_ctx: i32,
-    /// Eviction policy.
-    evict: EvictMode,
-    /// Pinned-prefix length: the preamble tokens replayed verbatim on every reset (the
-    /// StreamingLLM "sink", except here it carries real content). Set in `prime`.
-    n_keep: i32,
-    /// The preamble tokens, kept for replay on reset.
-    preamble: Vec<Token>,
-    /// Rolling ring of recent STREAM token *ids* — distinct from `recent`'s strings, because
-    /// detok→retok is not round-trip safe, so we replay the actual ids. Capped at `keep_recent`.
-    recent_ids: VecDeque<Token>,
-    /// The COMPLETE stream-token content currently in seq 0 (everything decoded since the last reset
-    /// / prime — NOT capped, so it can grow to ~n_ctx between resets). The full live context is
-    /// `preamble + context_ids`; this is what the context-dumping diagnostics replay so they show
-    /// *all* the tokens the model is attending to, not just the recent window. Reset to `recent_ids`
-    /// on a roll (the post-reset seq-0 stream content).
-    context_ids: Vec<Token>,
-    /// How many recent stream tokens to replay after a reset (the rolling window).
-    keep_recent: usize,
-    /// Post-reset trigger-suppression countdown.
-    settle: usize,
-    /// Count of resets so far (for the TUI status line / validation).
-    resets: u64,
+    /// StreamingLLM cap+reset window (#6): the pinned-prefix sink (preamble), the rolling recent-id
+    /// window, the full-context record, and the reset/settle counters. Pure state (no session); see
+    /// `window::StreamWindow`. `roll`/`prime` do the KV rebuild around it.
+    window: StreamWindow,
     /// Turn-boundary token ids (gemma chat). Used to stop interjection generation cleanly —
     /// `is_eog_token` does NOT reliably flag `<end_of_turn>` in this build, and `<start_of_turn>`
     /// is never EOG but signals the model has begun a new turn (its reply is over).
@@ -289,14 +275,7 @@ impl<'a> Lobe<'a> {
             recent: VecDeque::with_capacity(RECENT_TOKENS),
             firing: Firing::default(),
             n_ctx: n_ctx as i32,
-            evict: EvictMode::Reset,
-            n_keep: 0,
-            preamble: Vec::new(),
-            recent_ids: VecDeque::new(),
-            context_ids: Vec::new(),
-            keep_recent: 4096,
-            settle: 0,
-            resets: 0,
+            window: StreamWindow::default(),
             eot,
             sot,
             interjection: None,
@@ -360,8 +339,7 @@ impl<'a> Lobe<'a> {
         z_threshold: f32,
         stats: &crate::stats::Welford,
     ) -> FireOutcome {
-        let suppressed = self.settle > 0;
-        self.settle = self.settle.saturating_sub(1);
+        let suppressed = self.window.tick_settle();
         let warm = stats.count() > stats.warmup();
         let (fired, in_refractory, gate) = self.firing.decide(text, z, z_threshold, warm, suppressed);
         if fired {
@@ -441,11 +419,7 @@ impl<'a> Lobe<'a> {
     /// diagnostic emits, so a trace shows *all* the tokens in context, not a truncated recent window.
     /// Specials render as text (`detok`) so the turn markers are visible.
     fn full_context_text(&self) -> String {
-        self.preamble
-            .iter()
-            .chain(self.context_ids.iter())
-            .map(|&t| self.detok(t))
-            .collect()
+        self.window.full_ids().map(|&t| self.detok(t)).collect()
     }
 
     /// Choose how interjections see context: forked-full-context (`Context`) or snippet (#7 nuance).
@@ -516,23 +490,12 @@ impl<'a> Lobe<'a> {
     /// Configure cap + reset (#6): eviction mode and how many recent stream tokens to replay on a
     /// reset. The pinned prefix `n_keep` is captured separately in `prime`. Call before `prime`.
     pub fn set_eviction(&mut self, evict: EvictMode, keep_recent: usize) {
-        self.evict = evict;
-        self.keep_recent = keep_recent.max(1);
+        self.window.set_eviction(evict, keep_recent);
     }
 
     /// Resets performed so far (validation / TUI status).
     pub fn resets(&self) -> u64 {
-        self.resets
-    }
-
-    /// Append a committed stream token id to the rolling reset window AND to the full live-context
-    /// record (`context_ids`, uncapped — the complete seq-0 stream content for diagnostics).
-    fn push_recent_id(&mut self, tok: Token) {
-        self.recent_ids.push_back(tok);
-        while self.recent_ids.len() > self.keep_recent {
-            self.recent_ids.pop_front();
-        }
-        self.context_ids.push(tok);
+        self.window.resets()
     }
 
     /// Append an observed token's text to the rolling recent-context window.
@@ -566,7 +529,7 @@ impl<'a> Lobe<'a> {
     fn decode_one(&mut self, tok: Token) -> Result<()> {
         // #6: cap + reset. Roll over BEFORE the cache physically fills; the margin also reserves
         // slots for an in-flight interjection/RAG prefill that shares the unified cache (GEN_SEQ).
-        if self.evict == EvictMode::Reset {
+        if self.window.evict == EvictMode::Reset {
             let margin = self.roll_margin();
             if self.pos >= self.n_ctx - margin {
                 self.roll()?;
@@ -625,21 +588,12 @@ impl<'a> Lobe<'a> {
     /// Prime the context with preamble tokens (system prompt etc.). Records them for replay on a
     /// reset and captures the pinned-prefix length. No scoring.
     pub fn prime(&mut self, tokens: &[Token]) -> Result<()> {
-        self.preamble = tokens.to_vec();
-        self.n_keep = tokens.len() as i32;
         // Keep pinned prefix + rolling window comfortably inside the context (leaving room for an
-        // interjection's concurrent footprint); clamp + warn if the configured window is too large.
+        // interjection's concurrent footprint); the window clamps + warns if it's too large.
+        let n_keep = tokens.len() as i32;
         let margin = self.roll_margin();
-        let room = (self.n_ctx - self.n_keep - margin).max(1) as usize;
-        if self.keep_recent > room {
-            eprintln!(
-                "[lobe] keep_recent {} too large for n_ctx {} (n_keep {}); clamping to {}",
-                self.keep_recent, self.n_ctx, self.n_keep, room
-            );
-            self.keep_recent = room;
-        }
-        self.recent_ids = VecDeque::with_capacity(self.keep_recent);
-        self.context_ids.clear(); // the stream part of seq 0 starts empty (preamble is separate)
+        let room = (self.n_ctx - n_keep - margin).max(1) as usize;
+        self.window.begin_prime(tokens.to_vec(), room, self.n_ctx);
         self.prefill_seq0(tokens)
     }
 
@@ -649,19 +603,16 @@ impl<'a> Lobe<'a> {
     fn roll(&mut self) -> Result<()> {
         let t0 = std::time::Instant::now();
         let pos_before = self.pos;
-        let window = self.recent_ids.len();
+        let window = self.window.window_len();
         self.session.clear_seq(0)?;
-        let mut replay = self.preamble.clone();
-        replay.extend(self.recent_ids.iter().copied());
+        let replay = self.window.replay_tokens();
         let replay_len = replay.len();
         self.pos = 0;
         self.last_logits.clear();
         self.prefill_seq0(&replay)?;
-        // The rebuilt seq-0 stream content is exactly the replayed window, so the full-context record
-        // tracks it (then grows again as new tokens stream in).
-        self.context_ids = self.recent_ids.iter().copied().collect();
-        self.settle = RESET_SETTLE;
-        self.resets += 1;
+        // The rebuilt seq-0 stream content is exactly the replayed window, so the window syncs its
+        // full-context record to it, arms the post-reset settle, and bumps the reset counter.
+        self.window.mark_rolled();
         // Window-slide observability: a reset cleared seq 0 and rebuilt sink + recent window. At INFO
         // we also dump the reconstructed context split into the two parts, so a trace can SEE that the
         // opening framing is preserved intact: `framing` = the verbatim-replayed preamble (the BOS +
@@ -669,19 +620,19 @@ impl<'a> Lobe<'a> {
         // tokens (the ONLY part that slides). Gated by `enabled!` so it's free when no subscriber is on.
         let dump = tracing::enabled!(target: "lobe::roll", tracing::Level::INFO);
         let framing = if dump {
-            self.preamble.iter().map(|&t| self.detok(t)).collect::<String>()
+            self.window.preamble.iter().map(|&t| self.detok(t)).collect::<String>()
         } else {
             String::new()
         };
         let window_text = if dump {
-            self.recent_ids.iter().map(|&t| self.detok(t)).collect::<String>()
+            self.window.recent_ids().map(|&t| self.detok(t)).collect::<String>()
         } else {
             String::new()
         };
         tracing::info!(
             target: "lobe::roll", kind = "window_slide",
-            reset_index = self.resets, stream_index = self.stream_index as u64,
-            pos_before = pos_before as i64, pos_after = self.pos as i64, n_keep = self.n_keep as i64,
+            reset_index = self.window.resets(), stream_index = self.stream_index as u64,
+            pos_before = pos_before as i64, pos_after = self.pos as i64, n_keep = self.window.n_keep as i64,
             recent_window = window as u64, replay_len = replay_len as u64, n_ctx = self.n_ctx as i64,
             latency_us = t0.elapsed().as_micros() as u64,
             framing = %framing, window = %window_text,
@@ -708,7 +659,7 @@ impl<'a> Lobe<'a> {
             self.remember(&text);
             self.memory.push_span(&text);
             self.decode_one(tok)?;
-            self.push_recent_id(tok);
+            self.window.push_id(tok);
             let idx = self.stream_index;
             self.stream_index += 1;
             return Ok(Step {
@@ -773,7 +724,7 @@ impl<'a> Lobe<'a> {
         let dec_t = std::time::Instant::now();
         self.decode_one(tok)?;
         let decode_us = dec_t.elapsed().as_micros() as u64;
-        self.push_recent_id(tok);
+        self.window.push_id(tok);
 
         if obs_debug {
             tracing::debug!(
@@ -838,7 +789,7 @@ impl<'a> Lobe<'a> {
             self.remember(&text);
             self.memory.push_span(&text);
             self.decode_one(stream_tok)?;
-            self.push_recent_id(stream_tok);
+            self.window.push_id(stream_tok);
             let idx = self.stream_index;
             self.stream_index += 1;
             return Ok(StepOutcome {
@@ -860,7 +811,7 @@ impl<'a> Lobe<'a> {
         //    interjection: both seq 0 and GEN_SEQ add cells each tick (~2×interject_max + the ask),
         //    and a fire can land just under the threshold — so reserve for the whole interjection.
         self.icfg.max_hint = interject_max; // keep the roll margin sized to the actual cap
-        if self.evict == EvictMode::Reset && !self.gen_in_flight {
+        if self.window.evict == EvictMode::Reset && !self.gen_in_flight {
             let margin = self.roll_margin();
             if self.pos >= self.n_ctx - margin {
                 self.roll()?;
@@ -963,7 +914,7 @@ impl<'a> Lobe<'a> {
         }
 
         // 4. Advance seq 0 (mirrors decode_one's pos++ and observe's recent_id push).
-        self.push_recent_id(stream_tok);
+        self.window.push_id(stream_tok);
         self.pos += 1;
 
         // 5. Start a new interjection on a fresh fire (only if not already generating). The fork +
