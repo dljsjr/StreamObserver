@@ -100,11 +100,14 @@ use crate::backend::{ActiveBackend, Backend, Decode, Detok, Session, SessionConf
 // (= `backend::llama::LlamaBackend` or `backend::candle::CandleBackend`, per cargo feature).
 // Load it with `ActiveBackend::load(path, gpu_layers, verbose)`; it plays the old `Engine` role.
 
-pub struct Lobe<'a> {
+// Generic over the backend `B` (the `Backend`/`Session` trait pair), defaulting to the cfg-selected
+// `ActiveBackend` so every caller (`main`, the frontends) writes plain `Lobe` and is unaffected. The
+// default + the trait seam are what let a test inject a mock backend with scripted logits.
+pub struct Lobe<'a, B: Backend = ActiveBackend> {
     /// The backend (model + tokenizer), borrowed for tokenize/detok/is_eog/special-token lookups.
-    engine: &'a ActiveBackend,
+    engine: &'a B,
     /// The inference session (KV cache + decode). All forward passes go through this.
-    session: <ActiveBackend as Backend>::Session<'a>,
+    session: B::Session<'a>,
     /// The next-token distribution produced by the most recent decode. We copy it out
     /// of the session immediately so we can score the *next* arriving token against it.
     last_logits: Vec<f32>,
@@ -143,8 +146,8 @@ pub struct Lobe<'a> {
     debug: crate::trace::DebugCfg,
 }
 
-impl<'a> Lobe<'a> {
-    pub fn new(engine: &'a ActiveBackend, n_ctx: u32, cfg: LobeConfig) -> Result<Self> {
+impl<'a, B: Backend> Lobe<'a, B> {
+    pub fn new(engine: &'a B, n_ctx: u32, cfg: LobeConfig) -> Result<Self> {
         // Two sequences (0 = observation stream, 1 = interjection scratch) over a UNIFIED KV cache:
         // one shared pool of n_ctx cells so seq 0 gets the full n_ctx (without unified the cache
         // partitions per sequence and seq 0 dies at n_ctx/2 — #6). The interjection on seq 1 borrows

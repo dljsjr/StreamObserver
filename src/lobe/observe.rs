@@ -18,7 +18,7 @@ struct FireOutcome {
     gate: bool,
 }
 
-impl Lobe<'_> {
+impl<B: Backend> Lobe<'_, B> {
     /// The firing decision, shared by `observe` and `step`. Advances the post-reset `settle` (#6)
     /// suppression counter (owned here), then delegates the refractory + identifier gate + threshold
     /// crossing to `Firing::decide`; on a fire it snapshots the delta span (memory). `text` is the
@@ -453,5 +453,174 @@ impl Lobe<'_> {
             },
             interjection,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::backend::{Backend, Decode, Detok, Session, SessionConfig, Token};
+    use crate::lobe::{Lobe, LobeConfig};
+    use crate::stats::Welford;
+    use anyhow::Result;
+    use std::collections::HashMap;
+
+    /// A fake backend (the `Backend`/`Session` seam realized for tests): no model, no GPU. Its decode
+    /// always yields the same RAMP distribution `logit[i] = -i`, so surprisal grows smoothly and
+    /// predictably with the scored token's id — `surprisal(id) ≈ logsumexp + id`. That lets a test
+    /// warm the baseline with low-id tokens and then spike it with a high-id one to force a trigger.
+    struct MockBackend {
+        n_vocab: usize,
+    }
+
+    /// A fake session: tracks per-seq max position (for `seq_pos_max`/leak checks) and holds the last
+    /// decode's logits. The ramp is recomputed each decode; the input tokens only move the cursors.
+    struct MockSession<'a> {
+        backend: &'a MockBackend,
+        last: Vec<f32>,
+        seq_pos: HashMap<u32, i32>,
+    }
+
+    impl Backend for MockBackend {
+        type Session<'a>
+            = MockSession<'a>
+        where
+            Self: 'a;
+        fn load(_path: &str, _gpu_layers: u32, _verbose: bool) -> Result<Self> {
+            Ok(Self { n_vocab: 8 })
+        }
+        fn n_vocab(&self) -> usize {
+            self.n_vocab
+        }
+        fn tokenize(&self, text: &str, _add_bos: bool) -> Result<Vec<Token>> {
+            // Deterministic byte→id mapping; enough to prime a preamble in the cap+reset test.
+            Ok(text
+                .bytes()
+                .map(|b| Token((b as usize % self.n_vocab) as i32))
+                .collect())
+        }
+        fn detok(&self, token: Token, _mode: Detok) -> String {
+            format!("t{}", token.0)
+        }
+        fn is_eog(&self, _token: Token) -> bool {
+            false
+        }
+        fn special_token(&self, _text: &str) -> Option<Token> {
+            None
+        }
+        fn session(&self, _cfg: SessionConfig) -> Result<MockSession<'_>> {
+            Ok(MockSession {
+                backend: self,
+                last: Vec::new(),
+                seq_pos: HashMap::new(),
+            })
+        }
+    }
+
+    impl Session for MockSession<'_> {
+        fn decode(&mut self, batch: &[Decode]) -> Result<()> {
+            self.last = (0..self.backend.n_vocab).map(|i| -(i as f32)).collect();
+            for d in batch {
+                let e = self.seq_pos.entry(d.seq).or_insert(-1);
+                *e = (*e).max(d.pos);
+            }
+            Ok(())
+        }
+        fn logits(&self, _i: usize) -> &[f32] {
+            &self.last
+        }
+        fn clear_seq(&mut self, seq: u32) -> Result<()> {
+            self.seq_pos.insert(seq, -1);
+            Ok(())
+        }
+        fn copy_seq(&mut self, _src: u32, _dst: u32) -> Result<()> {
+            Ok(())
+        }
+        fn seq_pos_max(&self, seq: u32) -> i32 {
+            self.seq_pos.get(&seq).copied().unwrap_or(-1)
+        }
+    }
+
+    // The very first stream token has no prior distribution to score against → a neutral step.
+    #[test]
+    fn first_token_is_neutral() -> Result<()> {
+        let backend = MockBackend { n_vocab: 8 };
+        let mut lobe = Lobe::new(&backend, 2048, LobeConfig::default())?;
+        let mut stats = Welford::new(2, 0);
+        let step = lobe.observe(Token(3), &mut stats, 3.0, 5)?;
+        assert_eq!(step.surprisal, 0.0);
+        assert!(!step.fired);
+        assert_eq!(step.stream_index, 0);
+        assert_eq!(lobe.position(), 1); // the token was still fed into the cache
+        Ok(())
+    }
+
+    // Each observed token advances the KV position and the stream index.
+    #[test]
+    fn observe_advances_position_and_index() -> Result<()> {
+        let backend = MockBackend { n_vocab: 8 };
+        let mut lobe = Lobe::new(&backend, 2048, LobeConfig::default())?;
+        let mut stats = Welford::new(2, 0);
+        for i in 0..5 {
+            let step = lobe.observe(Token(i % 4), &mut stats, 3.0, 5)?;
+            assert_eq!(step.stream_index, i as usize);
+        }
+        assert_eq!(lobe.position(), 5);
+        Ok(())
+    }
+
+    // A token far above the warmed baseline fires a trigger carrying the model's expectations.
+    #[test]
+    fn high_surprisal_fires_after_warmup() -> Result<()> {
+        let backend = MockBackend { n_vocab: 8 };
+        let mut lobe = Lobe::new(&backend, 2048, LobeConfig::default())?;
+        let mut stats = Welford::new(2, 0);
+        // Warm the baseline with low-id (low-surprisal) tokens; none should fire.
+        for &id in &[0, 1, 0, 1, 0] {
+            assert!(!lobe.observe(Token(id), &mut stats, 3.0, 5)?.fired);
+        }
+        // A high-id token sits far up the ramp → a big surprisal spike → fires.
+        let spike = lobe.observe(Token(7), &mut stats, 3.0, 5)?;
+        assert!(spike.fired);
+        let trigger = spike.trigger.expect("a fired step carries a trigger");
+        assert!(trigger.surprisal > 5.0); // ~7.5 on the ramp for token id 7
+        assert!(!trigger.expected.is_empty()); // top-k expectations populated
+        Ok(())
+    }
+
+    // Entropy is the same for every ramp distribution, so the entropy signal never spikes — a guard
+    // that the pluggable signal is actually wired to the firing decision.
+    #[test]
+    fn entropy_signal_does_not_fire_on_constant_distribution() -> Result<()> {
+        let backend = MockBackend { n_vocab: 8 };
+        let cfg = LobeConfig {
+            signal: crate::lobe::Signal::Entropy,
+            ..LobeConfig::default()
+        };
+        let mut lobe = Lobe::new(&backend, 2048, cfg)?;
+        let mut stats = Welford::new(2, 0);
+        for &id in &[0, 1, 7, 2, 7, 0, 7] {
+            assert!(!lobe.observe(Token(id), &mut stats, 3.0, 5)?.fired);
+        }
+        Ok(())
+    }
+
+    // Cap+reset (#6): a small context rolls before it fills, and observation continues across resets.
+    #[test]
+    fn cap_reset_rolls_and_continues() -> Result<()> {
+        let backend = MockBackend { n_vocab: 8 };
+        let cfg = LobeConfig {
+            keep_recent: 64,
+            ..LobeConfig::default()
+        };
+        let mut lobe = Lobe::new(&backend, 512, cfg)?;
+        let preamble = lobe.tokenize("sink", true)?;
+        lobe.prime(&preamble)?;
+        let mut stats = Welford::new(2, 0);
+        for i in 0..400 {
+            lobe.observe(Token(i % 5), &mut stats, 3.0, 5)?;
+        }
+        assert!(lobe.resets() >= 1); // it rolled at least once
+        assert!(lobe.position() < 512); // pos sawtooths below n_ctx, never overruns
+        Ok(())
     }
 }

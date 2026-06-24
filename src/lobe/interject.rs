@@ -132,7 +132,7 @@ impl Default for GenState {
     }
 }
 
-impl Lobe<'_> {
+impl<B: Backend> Lobe<'_, B> {
     /// Drive the streaming interjection-reveal state machine shared by the live frontends (tui /
     /// present / present-scene), so the dedup/reveal POLICY lives here, not duplicated in every UI.
     /// Given one tick's `InterjectStatus`, it buffers the opening as "thinking", aborts a doomed

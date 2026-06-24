@@ -29,7 +29,7 @@ pub struct RagOutcome {
     pub directive: Option<RetrievalDirective>,
 }
 
-impl Lobe<'_> {
+impl<B: Backend> Lobe<'_, B> {
     /// #8 — native tool-calling RAG hook. Declares a `search` tool in gemma-4's native format (see
     /// `prompt::rag_prompt`), lets the observer think and (if warranted) emit a native tool call, and
     /// parses the result into a free-text thought (the interjection) + an optional retrieval directive.
