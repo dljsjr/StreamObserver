@@ -96,3 +96,57 @@ pub struct StepOutcome {
     pub step: Step,
     pub interjection: InterjectStatus,
 }
+
+/// Everything the caller configures at construction, in one value (`Lobe::new(engine, n_ctx, cfg)`).
+/// Built once from the CLI; `new` distributes it into the sub-structs. Replaces the old swarm of
+/// `set_*` setters and the "must call before `prime()`" ordering hazard — there is no post-`new`
+/// configuration step, so the cache-sizing knobs (`evict`/`keep_recent`/`interject_max`) are
+/// guaranteed in place before `prime`. `Default` is the converged config (= every CLI default).
+pub struct LobeConfig {
+    /// Trigger signal (#4) + the identifier/entity firing gate.
+    pub signal: Signal,
+    pub identifiers_only: bool,
+    /// Cap+reset (#6): eviction policy + rolling-window size.
+    pub evict: EvictMode,
+    pub keep_recent: usize,
+    /// Interjection generation knobs.
+    pub interject_mode: InterjectMode,
+    pub ask_mode: AskMode,
+    pub novelty_mode: NoveltyMode,
+    pub interject_temp: f32,
+    pub interject_top_p: f32,
+    pub interject_max: usize,
+    /// Post-fire refractory period (tokens; 0 = off) and the opt-in dedup backstop (0 = off).
+    pub refractory: usize,
+    pub dedup: f32,
+    /// Structured-observability detail (`--debug-log`).
+    pub debug: crate::trace::DebugCfg,
+    /// `None` = the fixed reproducible seed (byte-identical runs, the default); `Some(s)` seeds both
+    /// RNG streams from entropy (`--non-deterministic`), so asides — and, with `fire_softness > 0`,
+    /// which tokens fire — vary run-to-run.
+    pub seed: Option<u64>,
+    /// Stochastic-firing softness (z-units); `0` = the deterministic hard threshold (default).
+    pub fire_softness: f32,
+}
+
+impl Default for LobeConfig {
+    fn default() -> Self {
+        Self {
+            signal: Signal::Surprisal,
+            identifiers_only: false,
+            evict: EvictMode::Reset,
+            keep_recent: 4096,
+            interject_mode: InterjectMode::Context,
+            ask_mode: AskMode::Passage,
+            novelty_mode: NoveltyMode::Fresh,
+            interject_temp: 0.7,
+            interject_top_p: 0.95,
+            interject_max: 96,
+            refractory: 0,
+            dedup: 0.0,
+            debug: crate::trace::DebugCfg::default(),
+            seed: None,
+            fire_softness: 0.0,
+        }
+    }
+}

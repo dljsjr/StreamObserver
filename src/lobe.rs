@@ -53,7 +53,9 @@ const INTERJECT_SENTENCE_SLACK: usize = 64;
 // The public vocabulary (CLI enums + per-token result types) lives in its own module; re-exported
 // here so existing `crate::lobe::{Signal, Step, ...}` paths hold for `main` and the frontends.
 mod types;
-pub use types::{AskMode, EvictMode, InterjectMode, NoveltyMode, Signal, Step, StepOutcome, Trigger};
+pub use types::{
+    AskMode, EvictMode, InterjectMode, LobeConfig, NoveltyMode, Signal, Step, StepOutcome, Trigger,
+};
 
 // #8 RAG lives in its own module (the result types, the rag() pass, the tool-call parser). `pub mod`
 // so `rag()`'s public return type (`RagOutcome`) is reachable; `Source` is re-exported for `main`.
@@ -142,7 +144,7 @@ pub struct Lobe<'a> {
 }
 
 impl<'a> Lobe<'a> {
-    pub fn new(engine: &'a ActiveBackend, n_ctx: u32) -> Result<Self> {
+    pub fn new(engine: &'a ActiveBackend, n_ctx: u32, cfg: LobeConfig) -> Result<Self> {
         // Two sequences (0 = observation stream, 1 = interjection scratch) over a UNIFIED KV cache:
         // one shared pool of n_ctx cells so seq 0 gets the full n_ctx (without unified the cache
         // partitions per sequence and seq 0 dies at n_ctx/2 — #6). The interjection on seq 1 borrows
@@ -159,45 +161,56 @@ impl<'a> Lobe<'a> {
         let eot = engine.special_token("<turn|>"); // turn close = the model's reply is done
         let sot = engine.special_token("<|turn>"); // turn open  = model started a new turn
 
-        Ok(Self {
+        // Distribute the config into the per-concern sub-structs (the construction is the only place
+        // they're configured — no post-`new` setters, so the ordering hazard with `prime` is gone).
+        let mut firing = Firing::default();
+        firing.set_signal(cfg.signal, cfg.identifiers_only);
+        firing.set_refractory(cfg.refractory);
+        firing.set_softness(cfg.fire_softness);
+        let icfg = InterjectConfig {
+            mode: cfg.interject_mode,
+            ask_mode: cfg.ask_mode,
+            novelty_mode: cfg.novelty_mode,
+            temp: cfg.interject_temp,
+            top_p: cfg.interject_top_p,
+            max_hint: cfg.interject_max,
+        };
+        let mut window = StreamWindow::default();
+        window.set_eviction(cfg.evict, cfg.keep_recent);
+        let mut memory = InterjectionMemory::default();
+        memory.set_dedup(cfg.dedup);
+
+        let mut lobe = Self {
             engine,
             session,
             last_logits: Vec::new(),
             pos: 0,
             stream_index: 0,
             recent: VecDeque::with_capacity(RECENT_TOKENS),
-            firing: Firing::default(),
+            firing,
             n_ctx: n_ctx as i32,
-            window: StreamWindow::default(),
+            window,
             eot,
             sot,
-            icfg: InterjectConfig::default(),
-            memory: InterjectionMemory::default(),
+            icfg,
+            memory,
             gen: GenState::default(),
-            debug: crate::trace::DebugCfg::default(),
-        })
+            debug: cfg.debug,
+        };
+        // Seed: leave the fixed reproducible defaults unless an entropy seed was supplied.
+        if let Some(seed) = cfg.seed {
+            lobe.seed_rngs(seed);
+        }
+        Ok(lobe)
     }
 
-    /// Set the structured-observability detail level (`--debug-log`). Has no effect unless a tracing
-    /// subscriber is installed; it only bounds how big the per-event dumps get.
-    pub fn set_debug(&mut self, cfg: crate::trace::DebugCfg) {
-        self.debug = cfg;
-    }
-
-    /// Configure interjection sampling (experiment). `temp <= 0` = greedy (default). Applies ONLY to
-    /// interjection generation; observation scoring is always exact greedy/argmax off real logits.
-    pub fn set_interject_sampling(&mut self, temp: f32, top_p: f32) {
-        self.icfg.temp = temp;
-        self.icfg.top_p = top_p;
-    }
-
-    /// Re-seed BOTH RNG streams from one seed: the interjection sampler (`rng_state`) and the
-    /// stochastic-firing RNG (`fire_rng`). Constant by default → reproducible runs; seed from entropy
-    /// (`--random-seed`) for non-determinism. The interjection sampler always affects aside *content*;
-    /// the firing RNG only matters when `--fire-softness > 0` (else the trigger is the deterministic
-    /// hard threshold). `fire_rng` is derived via a splitmix64 step so the two streams are independent
-    /// and decorrelated; both guard the xorshift64* `0` fixed point.
-    pub fn set_seed(&mut self, seed: u64) {
+    /// Re-seed BOTH RNG streams from one seed: the interjection sampler (`gen.rng`) and the
+    /// stochastic-firing RNG (`firing.fire_rng`). Constant by default → reproducible runs; seeded
+    /// from entropy (`--non-deterministic`) otherwise. The interjection sampler always affects aside
+    /// *content*; the firing RNG only matters when `fire_softness > 0` (else the trigger is the
+    /// deterministic hard threshold). The firing seed is derived via a splitmix64 step so the two
+    /// streams are independent and decorrelated; both guard the xorshift64* `0` fixed point.
+    fn seed_rngs(&mut self, seed: u64) {
         let s = if seed == 0 { 0x9E3779B97F4A7C15 } else { seed };
         self.gen.rng = s;
         let mut z = s.wrapping_add(0x9E3779B97F4A7C15);
@@ -205,18 +218,6 @@ impl<'a> Lobe<'a> {
         z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
         z ^= z >> 31;
         self.firing.seed_rng(if z == 0 { 0x2545F4914F6CDD1D } else { z });
-    }
-
-    /// Set the stochastic-firing softness (z-units). `0` (default) = deterministic hard threshold;
-    /// `> 0` makes firing probabilistic (`sigmoid((z - threshold)/softness)`) off the seeded firing
-    /// RNG, so which tokens fire varies under `--random-seed` and reproduces under `--seed`.
-    pub fn set_fire_softness(&mut self, softness: f32) {
-        self.firing.set_softness(softness);
-    }
-
-    /// Hint for the max interjection length (tokens) — sizes the cap+reset roll margin (#6 / fused).
-    pub fn set_interject_max_hint(&mut self, m: usize) {
-        self.icfg.max_hint = m;
     }
 
     /// Cap+reset roll margin (FUSED_CACHE_GO_NOGO §4a): how far below `n_ctx` seq 0 must roll so that
@@ -240,23 +241,6 @@ impl<'a> Lobe<'a> {
     /// Specials render as text (`detok`) so the turn markers are visible.
     fn full_context_text(&self) -> String {
         self.window.full_ids().map(|&t| self.detok(t)).collect()
-    }
-
-    /// Choose how interjections see context: forked-full-context (`Context`) or snippet (#7 nuance).
-    pub fn set_interject_mode(&mut self, mode: InterjectMode) {
-        self.icfg.mode = mode;
-    }
-
-    /// EXPERIMENT: set the context-mode ask framing (H2) and novelty framing (H4). Defaults are the
-    /// control variants (`Passage` / `Fresh`); these only change behavior when set off-control.
-    pub fn set_ask_mode(&mut self, ask: AskMode, novelty: NoveltyMode) {
-        self.icfg.ask_mode = ask;
-        self.icfg.novelty_mode = novelty;
-    }
-
-    /// Set the near-duplicate interjection suppression threshold (Jaccard word overlap; 0 = off).
-    pub fn set_dedup(&mut self, threshold: f32) {
-        self.memory.set_dedup(threshold);
     }
 
     /// Record an emitted interjection as novelty memory for the next ask (see
@@ -294,23 +278,6 @@ impl<'a> Lobe<'a> {
         self.gen.out.clear();
         self.gen.produced = 0;
         Ok(())
-    }
-
-    /// Configure the pluggable trigger signal (#4) and the identifier/entity firing gate.
-    pub fn set_signal(&mut self, signal: Signal, identifiers_only: bool) {
-        self.firing.set_signal(signal, identifiers_only);
-    }
-
-    /// Post-fire refractory period (tokens): how long the observer stays quiet after remarking, so
-    /// it doesn't obsess over the same salient thing while it lingers in the window. 0 disables.
-    pub fn set_refractory(&mut self, period: usize) {
-        self.firing.set_refractory(period);
-    }
-
-    /// Configure cap + reset (#6): eviction mode and how many recent stream tokens to replay on a
-    /// reset. The pinned prefix `n_keep` is captured separately in `prime`. Call before `prime`.
-    pub fn set_eviction(&mut self, evict: EvictMode, keep_recent: usize) {
-        self.window.set_eviction(evict, keep_recent);
     }
 
     /// Resets performed so far (validation / TUI status).

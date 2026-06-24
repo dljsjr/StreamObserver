@@ -28,7 +28,9 @@ use std::io::{BufRead, Write};
 use std::time::Instant;
 
 use backend::{ActiveBackend, Backend};
-use lobe::{AskMode, EvictMode, InterjectMode, Lobe, NoveltyMode, Signal, Source, Step, Trigger};
+use lobe::{
+    AskMode, EvictMode, InterjectMode, Lobe, LobeConfig, NoveltyMode, Signal, Source, Step, Trigger,
+};
 use stats::Welford;
 
 /// Retriever seam (#8). The real backends — file-memory for `mem` (this session's stored context),
@@ -337,30 +339,33 @@ fn main() -> Result<()> {
     };
 
     let engine = ActiveBackend::load(&cli.model, cli.gpu_layers, cli.verbose)?;
-    let mut lobe = Lobe::new(&engine, cli.ctx)?;
-    lobe.set_signal(cli.signal, cli.identifiers_only);
-    lobe.set_eviction(cli.evict, cli.keep_recent); // #6: must be set before prime()
-    lobe.set_interject_mode(cli.interject_mode);
-    lobe.set_ask_mode(cli.ask_mode, cli.novelty); // EXPERIMENT toggles (default = control)
-    lobe.set_refractory(cli.refractory);
-    lobe.set_dedup(cli.dedup);
-    lobe.set_debug(trace::DebugCfg {
-        topk: cli.debug_topk,
-        full_logits: cli.debug_full_logits,
-    });
-    lobe.set_interject_sampling(cli.interject_temp, cli.interject_top_p);
-    lobe.set_interject_max_hint(cli.interject_max); // sizes the cap+reset roll margin (#6 / fused)
-    // Sampler seed: fixed (reproducible) by default; entropy-seeded with --random-seed (the asides
-    // then vary run-to-run, like a chat API). Only interjection CONTENT is affected — the surprisal
-    // trigger is greedy and deterministic regardless.
-    // Determinism: runs are byte-identical by default (Lobe::new already seeds a fixed value and
-    // leaves firing on the hard threshold). --non-deterministic picks a random seed from OS entropy
-    // and softens the firing decision (sigmoid, z-units), so both the asides AND which tokens fire
-    // vary run-to-run. 0.5 is the firing-sigmoid softness — a ~±1z transition band around z_threshold.
-    if cli.non_deterministic {
-        lobe.set_seed(entropy_seed());
-        lobe.set_fire_softness(0.5);
-    }
+    // All construction-time config in one value (no post-`new` setters, no before-`prime` ordering
+    // hazard). Determinism: byte-identical by default (seed None = fixed reproducible RNG + hard
+    // firing threshold). --non-deterministic seeds both RNG streams from OS entropy AND softens the
+    // firing decision (sigmoid, z-units), so both the asides AND which tokens fire vary run-to-run;
+    // 0.5 is a ~±1z transition band around z_threshold. Only interjection CONTENT and (softened)
+    // firing are affected — the surprisal value itself is always the exact greedy read.
+    let config = LobeConfig {
+        signal: cli.signal,
+        identifiers_only: cli.identifiers_only,
+        evict: cli.evict,
+        keep_recent: cli.keep_recent,
+        interject_mode: cli.interject_mode,
+        ask_mode: cli.ask_mode, // EXPERIMENT toggles (default = control)
+        novelty_mode: cli.novelty,
+        interject_temp: cli.interject_temp,
+        interject_top_p: cli.interject_top_p,
+        interject_max: cli.interject_max,
+        refractory: cli.refractory,
+        dedup: cli.dedup,
+        debug: trace::DebugCfg {
+            topk: cli.debug_topk,
+            full_logits: cli.debug_full_logits,
+        },
+        seed: cli.non_deterministic.then(entropy_seed),
+        fire_softness: if cli.non_deterministic { 0.5 } else { 0.0 },
+    };
+    let mut lobe = Lobe::new(&engine, cli.ctx, config)?;
 
     // One config dump so every trace file is self-describing (what produced this run).
     tracing::info!(
