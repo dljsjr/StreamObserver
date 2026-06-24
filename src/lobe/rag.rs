@@ -21,12 +21,16 @@ pub struct RetrievalDirective {
     pub query: String,
 }
 
-/// Result of a #8 RAG pass: the free thinking (interjection text) plus an optional retrieval
-/// directive the model emitted as a native tool call. `directive` is None when it abstained.
-#[derive(Clone, Debug)]
+/// Result of a #8 RAG pass: the free thinking before the call, the optional retrieval directive the
+/// model emitted as a native tool call, the snippet retrieval returned (for the `retrieval` event),
+/// and the grounded reply the model generated AFTER the snippet was fed back. `directive`/`retrieved`/
+/// `response` are None when the model abstained or retrieval found nothing.
+#[derive(Clone, Debug, Default)]
 pub struct RagOutcome {
     pub thought: String,
     pub directive: Option<RetrievalDirective>,
+    pub retrieved: Option<String>,
+    pub response: Option<String>,
 }
 
 impl<B: Backend> Lobe<'_, B> {
@@ -36,7 +40,12 @@ impl<B: Backend> Lobe<'_, B> {
     /// No grammar — the modal think→call structure is the model's own. Generation renders special
     /// tokens as text (`detok`, not `detok_gen`) so the `<|tool_call>…<tool_call|>` markers survive for
     /// parsing. Snippet-based (uses the recent window); stops at the model's turn-close after the call.
-    pub fn rag(&mut self, surprising: &str, max: usize) -> Result<RagOutcome> {
+    pub fn rag<F: Fn(Source, &str) -> Option<String>>(
+        &mut self,
+        surprising: &str,
+        max: usize,
+        retrieve: F,
+    ) -> Result<RagOutcome> {
         self.session.clear_seq(GEN_SEQ as u32)?;
         let recent: String = self.recent.iter().map(String::as_str).collect();
         let prompt = crate::prompt::rag_prompt(word_aligned(&recent).trim(), surprising);
@@ -47,6 +56,8 @@ impl<B: Backend> Lobe<'_, B> {
         let mut raw = String::new();
         let mut pos = toks.len() as i32;
         let mut produced = 0usize;
+        // PHASE 1 — think + (maybe) call. Stop at the call-close marker so we can answer it inline,
+        // or at a turn/eog boundary (abstain → just the sentence), or the cap.
         for _ in 0..max {
             let tok = argmax(&logits);
             if self.engine.is_eog(tok) || Some(tok) == self.eot {
@@ -56,9 +67,36 @@ impl<B: Backend> Lobe<'_, B> {
             logits = self.decode_seq(&[tok], pos, GEN_SEQ)?;
             pos += 1;
             produced += 1;
+            if raw.contains("<tool_call|>") {
+                break; // the call is complete — go answer it
+            }
+        }
+        let mut outcome = parse_rag_output(&raw);
+        // PHASE 2 — feedback loop. If a call was emitted and retrieval hits, feed the result back
+        // INLINE in the same model turn (gemma-native `<|tool_response>`) and continue generating a
+        // grounded reply. detok_gen (specials suppressed) — this part is the user-facing aside.
+        if let Some(d) = &outcome.directive {
+            if let Some(snippet) = retrieve(d.source, &d.query) {
+                let bridge = crate::prompt::rag_tool_response(&snippet);
+                let btoks = self.tokenize(&bridge, false)?; // continuation, no BOS
+                logits = self.decode_seq(&btoks, pos, GEN_SEQ)?;
+                pos += btoks.len() as i32;
+                let mut resp = String::new();
+                for _ in 0..max {
+                    let tok = argmax(&logits);
+                    if self.engine.is_eog(tok) || Some(tok) == self.eot {
+                        break;
+                    }
+                    resp.push_str(&self.detok_gen(tok));
+                    logits = self.decode_seq(&[tok], pos, GEN_SEQ)?;
+                    pos += 1;
+                    produced += 1;
+                }
+                outcome.retrieved = Some(snippet);
+                outcome.response = Some(resp.trim().to_string());
+            }
         }
         self.session.clear_seq(GEN_SEQ as u32)?;
-        let outcome = parse_rag_output(&raw);
         let (src, query) = match &outcome.directive {
             Some(d) => (
                 match d.source {
@@ -76,6 +114,8 @@ impl<B: Backend> Lobe<'_, B> {
             latency_us = t0.elapsed().as_micros() as u64,
             directive_source = src, directive_query = %query,
             thought = %outcome.thought, raw_output = %raw,
+            retrieved = outcome.retrieved.as_deref().unwrap_or(""),
+            response = outcome.response.as_deref().unwrap_or(""),
             prompt = %prompt, // raw model input, verbatim
             "rag"
         );
@@ -101,11 +141,12 @@ fn parse_rag_output(raw: &str) -> RagOutcome {
             RagOutcome {
                 thought: before.trim().to_string(),
                 directive,
+                ..Default::default()
             }
         }
         None => RagOutcome {
             thought: raw.trim().to_string(),
-            directive: None,
+            ..Default::default()
         },
     }
 }

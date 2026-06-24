@@ -84,6 +84,15 @@ pub fn rag_prompt(recent: &str, surprising: &str) -> String {
     )
 }
 
+/// The #8 tool-response block, fed back INLINE in the same model turn right after the model's
+/// `<tool_call|>` so generation continues grounded in the result. The format is gemma-4's own
+/// (derived from the GGUF `tokenizer.chat_template` `format_tool_response_block` macro, string
+/// response branch): `<|tool_response>response:search{value:<|"|>…<|"|>}<tool_response|>`. Tokenize
+/// with `add_bos = false` — it's a continuation, not a new sequence.
+pub fn rag_tool_response(snippet: &str) -> String {
+    format!("<|tool_response>response:search{{value:<|\"|>{snippet}<|\"|>}}<tool_response|>")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,5 +144,16 @@ mod tests {
         assert!(p.starts_with("<|turn>system\n<|tool>declaration:search"));
         assert!(p.contains("<|turn>user\n"));
         assert!(p.ends_with("<|turn>model\n"));
+    }
+
+    #[test]
+    fn tool_response_uses_gemma_native_inline_format() {
+        let r = rag_tool_response("the Pequod set sail");
+        // Inline block (no turn markers) in gemma-4's own format; the snippet is quote-delimited.
+        assert_eq!(
+            r,
+            "<|tool_response>response:search{value:<|\"|>the Pequod set sail<|\"|>}<tool_response|>"
+        );
+        assert!(!r.contains("<|turn>")); // continues the model turn, doesn't open a new one
     }
 }

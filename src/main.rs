@@ -622,19 +622,27 @@ fn handle_rag(
     corpus: Option<&retrieval::Corpus>,
     out: &mut impl Write,
 ) -> Result<()> {
-    let rag_out = lobe.rag(surprising, 160)?;
+    // Retrieval is injected as a function argument (the `--rag-corpus` BM25 index, or nothing).
+    let rag_out = lobe.rag(surprising, 160, |_source, query| {
+        corpus.and_then(|c| retrieval::search(c, query))
+    })?;
     record_and_emit_interjection(lobe, stream_index, surprising, rag_out.thought.trim(), out)?;
     if let Some(d) = &rag_out.directive {
         let src = match d.source {
             Source::Mem => "mem",
             Source::Rag => "rag",
         };
-        let snippet = corpus.and_then(|c| retrieval::search(c, &d.query));
         let rev = serde_json::json!({
             "event": "retrieval", "stream_index": stream_index, "source": src,
-            "query": d.query, "found": snippet.is_some(), "snippet": snippet,
+            "query": d.query, "found": rag_out.retrieved.is_some(), "snippet": rag_out.retrieved,
         });
         writeln!(out, "{rev}")?;
+        // The grounded reply (after the snippet was fed back) is the actual promotion — emit it too.
+        if let Some(resp) = rag_out.response.as_deref() {
+            if !resp.is_empty() {
+                record_and_emit_interjection(lobe, stream_index, surprising, resp, out)?;
+            }
+        }
     }
     Ok(())
 }
