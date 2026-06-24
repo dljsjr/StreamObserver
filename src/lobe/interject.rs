@@ -216,7 +216,11 @@ impl<B: Backend> Lobe<'_, B> {
     /// per-interjection stall), then seed the fused gen cursors. Subsequent reply tokens co-batch in
     /// `step()`. Mirrors `interject_begin` but drives the fused `gen_*` state instead of the
     /// timesliced `InterjectState`.
-    pub(crate) fn start_fused_interjection(&mut self, max: usize) -> Result<()> {
+    pub(crate) fn start_fused_interjection(
+        &mut self,
+        max: usize,
+        recalled: Option<&str>,
+    ) -> Result<()> {
         self.session.clear_seq(GEN_SEQ as u32)?;
         let (toks, start_pos) = match self.icfg.mode {
             InterjectMode::Snippet => {
@@ -230,7 +234,7 @@ impl<B: Backend> Lobe<'_, B> {
                 // `self.pos` is the small pinned-prefix+window, so the fork+ask+gen fits exactly,
                 // never an estimate. Re-tokenize after the roll (the span/novelty text is unchanged,
                 // but `self.recent`/`last_span` survive the roll so the ask is identical anyway).
-                let ask = self.interject_ask_context(None);
+                let ask = self.interject_ask_context(recalled);
                 let mut toks = self.tokenize(&ask, false)?;
                 // Footprint above the fork = ask (GEN_SEQ) + gen tokens (GEN_SEQ) + seq-0's growth
                 // during the deferred-roll generation (BOTH sequences grow concurrently) ≈
@@ -241,7 +245,7 @@ impl<B: Backend> Lobe<'_, B> {
                     && self.pos + toks.len() as i32 + 2 * gen_ceiling + 32 > self.n_ctx
                 {
                     self.roll()?;
-                    let ask = self.interject_ask_context(None);
+                    let ask = self.interject_ask_context(recalled);
                     toks = self.tokenize(&ask, false)?;
                 }
                 self.session.copy_seq(0, GEN_SEQ as u32)?;

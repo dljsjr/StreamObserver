@@ -229,6 +229,7 @@ impl<B: Backend> Lobe<'_, B> {
         z_threshold: f32,
         topk: usize,
         interject_max: usize,
+        retrieve: &mut crate::retrieval::RetrieveFn,
     ) -> Result<StepOutcome> {
         // Neutral first token (no prior distribution): feed it, no scoring, no interjection.
         if self.last_logits.is_empty() {
@@ -334,7 +335,11 @@ impl<B: Backend> Lobe<'_, B> {
         // `Idle` ⟺ no gen activity this tick (not Working, not just-finished Done) ⟺ safe to start.
         // Deferring a start on a Done tick avoids clobbering the finished text in the status enum.
         if fired && matches!(interjection, InterjectStatus::Idle) {
-            self.start_fused_interjection(interject_max)?;
+            // #8 RAG (option E): retrieve on the surprising entity and weave the hit into the aside IN
+            // VOICE. `retrieve` is a no-op (→ None) unless `--rag` is on, so a plain run is unchanged.
+            // Only this query embed + the ask-prefill stall; the aside itself streams concurrently (3b).
+            let recalled = retrieve(&text);
+            self.start_fused_interjection(interject_max, recalled.as_deref())?;
             if self.gen.in_flight {
                 interjection = InterjectStatus::Started;
             }

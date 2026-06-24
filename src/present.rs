@@ -29,10 +29,9 @@ pub fn run(
     input_path: &str,
     tick_ms: u64,
     skip_to: &str,
-    retrieve: &mut dyn FnMut(&str) -> Option<String>,
+    retrieve: &mut crate::retrieval::RetrieveFn,
 ) -> Result<()> {
     let interject = cli.interject_on();
-    let rag = cli.rag;
     let interject_max = cli.interject_max;
     let mut raw = std::fs::read_to_string(input_path)?;
     if !skip_to.is_empty() {
@@ -96,10 +95,11 @@ pub fn run(
             // in one decode, so the prose keeps scrolling while the reply forms. (Same path the
             // calibration TUI uses; see tui.rs / CONCURRENT_FORWARD_PASS.md.)
             if let Some(tok) = feed.next() {
-                // --rag uses the blocking retrieval pass (observe + serialized rag()); otherwise the
-                // fused interjection. Both append to `asides`.
-                let (s, status) = if interject && !rag {
-                    let out = lobe.step(tok, &mut stats, z, cli.topk, interject_max)?;
+                // One fused step per tick. With --rag, step() retrieves on a fire and weaves the
+                // recall into the aside IN VOICE (still streamed concurrently; only the query embed +
+                // ask-prefill stall).
+                let (s, status) = if interject {
+                    let out = lobe.step(tok, &mut stats, z, cli.topk, interject_max, retrieve)?;
                     (out.step, Some(out.interjection))
                 } else {
                     (lobe.observe(tok, &mut stats, z, cli.topk)?, None)
@@ -114,15 +114,8 @@ pub fn run(
                     prose.drain(0..cut);
                 }
 
-                let aside = if rag {
-                    s.trigger.as_ref().map(|t| {
-                        crate::rag_aside(lobe, &t.token_text, interject_max, retrieve)
-                    }).transpose()?.map(|(a, _snippet)| a)
-                } else {
-                    // The dedup/reveal policy lives in the lobe; we store whatever survives.
-                    lobe.advance_reveal(status, &mut pending, &mut revealed)?
-                };
-                if let Some(text) = aside {
+                // The dedup/reveal policy lives in the lobe; we store whatever survives.
+                if let Some(text) = lobe.advance_reveal(status, &mut pending, &mut revealed)? {
                     asides.push(text);
                     if asides.len() > MAX_RECENT {
                         asides.remove(0);

@@ -42,10 +42,9 @@ pub fn run(
     input_path: &str,
     tick_ms: u64,
     skip_to: &str,
-    retrieve: &mut dyn FnMut(&str) -> Option<String>,
+    retrieve: &mut crate::retrieval::RetrieveFn,
 ) -> Result<()> {
     let interject = cli.interject_on(); // global flag (on by default; --no-interject disables)
-    let rag = cli.rag;
     let interject_max = cli.interject_max;
     // Pre-tokenize the whole transcript as the stream. add_bos=false (continuation).
     let mut raw = std::fs::read_to_string(input_path)?;
@@ -135,10 +134,10 @@ pub fn run(
             // validated crash-free over >10×n_ctx with interjections firing throughout.) `--no-interject`
             // drops to plain observation.
             if let Some(tok) = feed.next() {
-                // --rag uses the blocking retrieval pass (observe + serialized rag()); otherwise the
-                // fused interjection.
-                let (s, status) = if interject && !rag {
-                    let out = lobe.step(tok, &mut stats, z, cli.topk, interject_max)?;
+                // One fused step per tick. With --rag, step() retrieves on a fire and weaves the
+                // recall into the aside IN VOICE (still streamed concurrently via the fused path).
+                let (s, status) = if interject {
+                    let out = lobe.step(tok, &mut stats, z, cli.topk, interject_max, retrieve)?;
                     (out.step, Some(out.interjection))
                 } else {
                     (lobe.observe(tok, &mut stats, z, cli.topk)?, None)
@@ -152,27 +151,17 @@ pub fn run(
                     shaded.drain(0..1000); // cap transcript memory for the display
                 }
                 if let Some(t) = s.trigger {
-                    if rag {
-                        let (aside, _snippet) =
-                            crate::rag_aside(lobe, &t.token_text, interject_max, retrieve)?;
-                        interjections.push(format!(">> {aside}"));
-                        if interjections.len() > 50 {
-                            interjections.remove(0);
-                        }
-                    }
                     if triggers.len() == 64 {
                         triggers.pop_front();
                     }
                     triggers.push_back(t);
                 }
                 // The dedup/reveal policy lives in the lobe (shared by all live frontends); we just
-                // render `pending`/`revealed` and store whatever survives. (--rag uses the block above.)
-                if !rag {
-                    if let Some(text) = lobe.advance_reveal(status, &mut pending, &mut revealed)? {
-                        interjections.push(format!(">> {text}"));
-                        if interjections.len() > 50 {
-                            interjections.remove(0);
-                        }
+                // render `pending`/`revealed` and store whatever survives.
+                if let Some(text) = lobe.advance_reveal(status, &mut pending, &mut revealed)? {
+                    interjections.push(format!(">> {text}"));
+                    if interjections.len() > 50 {
+                        interjections.remove(0);
                     }
                 }
             } else {
