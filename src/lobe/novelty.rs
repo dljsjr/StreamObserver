@@ -168,3 +168,87 @@ fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f32 {
         inter / union
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The delta span accumulates observed tokens, then a fire snapshots + clears it.
+    #[test]
+    fn span_accumulates_then_snapshot_joins_and_clears() {
+        let mut m = InterjectionMemory::default();
+        m.push_span(" the");
+        m.push_span(" cat");
+        m.snapshot_span();
+        assert_eq!(m.last_span, " the cat");
+        // After snapshot the buffer is empty, so the next snapshot is blank.
+        m.snapshot_span();
+        assert_eq!(m.last_span, "");
+    }
+
+    // The span buffer is bounded so a long quiet stretch can't blow up the prompt.
+    #[test]
+    fn span_buffer_is_capped() {
+        let mut m = InterjectionMemory::default();
+        for _ in 0..(MAX_SPAN_TOKENS + 50) {
+            m.push_span(" x");
+        }
+        m.snapshot_span();
+        let words = m.last_span.split_whitespace().count();
+        assert_eq!(words, MAX_SPAN_TOKENS);
+    }
+
+    // record() keeps the most-recent DEDUP_HISTORY asides, newest-first via recent(), skipping blanks.
+    #[test]
+    fn record_keeps_recent_history_newest_first() {
+        let mut m = InterjectionMemory::default();
+        m.record("   "); // blank ignored
+        for i in 0..(DEDUP_HISTORY + 3) {
+            m.record(&format!("aside {i}"));
+        }
+        let recent: Vec<_> = m.recent(2).cloned().collect();
+        let last = DEDUP_HISTORY + 2;
+        assert_eq!(recent, vec![format!("aside {last}"), format!("aside {}", last - 1)]);
+        assert_eq!(m.recent(100).count(), DEDUP_HISTORY); // capped
+    }
+
+    // Dedup is opt-in: with threshold 0 everything is "novel"; the streaming reveal decides immediately.
+    #[test]
+    fn dedup_off_is_always_novel_and_immediately_decidable() {
+        let mut m = InterjectionMemory::default();
+        m.record("The repetition is stark");
+        assert!(m.is_novel("The repetition is stark")); // dedup off → even an exact repeat is "novel"
+        assert!(m.decidable("Th")); // no opening stem needed when dedup is off
+        assert!(!m.doomed("The repetition is stark"));
+    }
+
+    // With dedup on, a matching opening stem is a repeat (suppressed); a distinct opening is novel.
+    #[test]
+    fn dedup_on_flags_matching_opening_stem() {
+        let mut m = InterjectionMemory::default();
+        m.set_dedup(0.5);
+        m.record("The repetition is stark");
+        assert!(!m.is_novel("The repetition is a stutter")); // same 2-word opening stem → repeat
+        assert!(m.is_novel("A grove of pikes appears")); // different opening → novel
+    }
+
+    // Streaming reveal: with dedup on, a partial is only decidable once its opening stem is complete,
+    // and it's "doomed" early if that stem already matches a recent aside.
+    #[test]
+    fn doomed_needs_complete_opening_stem() {
+        let mut m = InterjectionMemory::default();
+        m.set_dedup(0.5);
+        m.record("The repetition is stark");
+        assert!(!m.decidable("The")); // only one word so far — can't judge yet
+        assert!(!m.doomed("The"));
+        assert!(m.decidable("The repetition")); // two-word stem complete
+        assert!(m.doomed("The repetition of mundane things")); // stem matches → will be a dup
+    }
+
+    #[test]
+    fn opening_stem_and_jaccard_helpers() {
+        assert_eq!(opening("The Repetition, stark!", 2), "the repetition");
+        assert_eq!(jaccard(&shingles("abcd"), &shingles("abcd")), 1.0);
+        assert!(jaccard(&shingles("the cat sat"), &shingles("a dog ran")) < 0.2);
+    }
+}

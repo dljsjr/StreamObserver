@@ -119,3 +119,84 @@ fn looks_like_identifier(text: &str) -> bool {
     // code-identifier-ish (snake_case / has a digit) OR proper-noun-ish (Capitalized).
     has_underscore || has_digit || starts_upper
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A freshly-defaulted Firing fires on a clear threshold crossing once the baseline is warm.
+    #[test]
+    fn fires_on_threshold_crossing_when_warm() {
+        let mut f = Firing::default();
+        let (fired, in_refractory, gate) = f.decide("token", 4.0, 3.0, true, false);
+        assert!(fired);
+        assert!(!in_refractory);
+        assert!(gate);
+    }
+
+    #[test]
+    fn does_not_fire_below_threshold() {
+        let mut f = Firing::default();
+        assert!(!f.decide("token", 2.9, 3.0, true, false).0);
+    }
+
+    // The three independent suppressors: cold baseline, post-reset settle, and post-fire refractory.
+    #[test]
+    fn cold_baseline_suppresses() {
+        let mut f = Firing::default();
+        assert!(!f.decide("token", 9.0, 3.0, false, false).0); // warm = false
+    }
+
+    #[test]
+    fn settle_suppression_blocks_firing() {
+        let mut f = Firing::default();
+        assert!(!f.decide("token", 9.0, 3.0, true, true).0); // suppressed = true
+    }
+
+    // After a fire, the refractory cooldown blocks exactly `period` subsequent tokens, then re-opens.
+    #[test]
+    fn refractory_blocks_period_tokens_then_reopens() {
+        let mut f = Firing::default();
+        f.set_refractory(3);
+        assert!(f.decide("a", 9.0, 3.0, true, false).0); // fires, arms refractory = 3
+        for _ in 0..3 {
+            assert!(!f.decide("a", 9.0, 3.0, true, false).0); // cooling down
+        }
+        assert!(f.decide("a", 9.0, 3.0, true, false).0); // re-opened
+    }
+
+    // The identifier gate (#4): with it on, only entity-shaped tokens may fire.
+    #[test]
+    fn identifier_gate_blocks_non_identifiers() {
+        let mut f = Firing::default();
+        f.set_signal(Signal::Surprisal, true);
+        let (fired, _, gate) = f.decide("the", 9.0, 3.0, true, false);
+        assert!(!fired);
+        assert!(!gate);
+        assert!(f.decide("Ishmael", 9.0, 3.0, true, false).0); // proper noun passes
+    }
+
+    // Stochastic firing (softness > 0) is deterministic per seed and ordered by z.
+    #[test]
+    fn stochastic_firing_is_reproducible_and_monotone_in_z() {
+        let run = |z: f32| {
+            let mut f = Firing::default();
+            f.set_softness(0.5);
+            f.seed_rng(0x1234_5678);
+            f.decide("t", z, 3.0, true, false).0
+        };
+        assert_eq!(run(9.0), run(9.0)); // same seed + z → same decision
+        assert!(run(20.0)); // far above threshold ~always fires
+        assert!(!run(-20.0)); // far below ~never fires
+    }
+
+    #[test]
+    fn looks_like_identifier_heuristic() {
+        assert!(looks_like_identifier("Ishmael")); // capitalized
+        assert!(looks_like_identifier("snake_case")); // underscore
+        assert!(looks_like_identifier("v2")); // digit
+        assert!(!looks_like_identifier("the")); // lowercase function word
+        assert!(!looks_like_identifier("x")); // too short
+        assert!(!looks_like_identifier("hello,")); // punctuation
+    }
+}

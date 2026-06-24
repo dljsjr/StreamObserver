@@ -128,3 +128,90 @@ impl StreamWindow {
         self.preamble.iter().chain(self.context_ids.iter())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t(i: i32) -> Token {
+        Token(i)
+    }
+
+    // The rolling window is capped at keep_recent; the full-context record is not.
+    #[test]
+    fn push_id_caps_recent_window_but_not_full_record() {
+        let mut w = StreamWindow::default();
+        w.set_eviction(EvictMode::Reset, 3);
+        for i in 0..10 {
+            w.push_id(t(i));
+        }
+        assert_eq!(w.window_len(), 3); // recent window capped
+        let recent: Vec<i32> = w.recent_ids().map(|tk| tk.0).collect();
+        assert_eq!(recent, vec![7, 8, 9]); // newest 3, in order
+        assert_eq!(w.full_ids().count(), 10); // full record uncapped (no preamble yet)
+    }
+
+    // set_eviction never lets keep_recent reach 0 (a zero window would replay nothing).
+    #[test]
+    fn keep_recent_is_floored_at_one() {
+        let mut w = StreamWindow::default();
+        w.set_eviction(EvictMode::Reset, 0);
+        for i in 0..5 {
+            w.push_id(t(i));
+        }
+        assert_eq!(w.window_len(), 1);
+    }
+
+    // begin_prime pins the preamble (n_keep), clears the stream content, and clamps keep_recent to room.
+    #[test]
+    fn begin_prime_pins_preamble_and_clamps_window() {
+        let mut w = StreamWindow::default();
+        w.set_eviction(EvictMode::Reset, 10_000);
+        w.push_id(t(99)); // stale content from a prior life
+        w.begin_prime(vec![t(1), t(2), t(3)], 256, 4096);
+        assert_eq!(w.n_keep, 3);
+        assert_eq!(w.window_len(), 0); // recent window reset
+        assert_eq!(w.full_ids().count(), 3); // == preamble only, stream content cleared
+    }
+
+    // replay_tokens is exactly the reset replay: pinned preamble followed by the rolling window.
+    #[test]
+    fn replay_tokens_is_preamble_then_window() {
+        let mut w = StreamWindow::default();
+        w.begin_prime(vec![t(1), t(2)], 256, 4096);
+        w.push_id(t(5));
+        w.push_id(t(6));
+        let replay: Vec<i32> = w.replay_tokens().iter().map(|tk| tk.0).collect();
+        assert_eq!(replay, vec![1, 2, 5, 6]);
+    }
+
+    // mark_rolled syncs the full record to the window, arms the settle suppression, and counts the reset.
+    #[test]
+    fn mark_rolled_syncs_record_and_counts_reset() {
+        let mut w = StreamWindow::default();
+        w.begin_prime(vec![t(1)], 256, 4096);
+        w.push_id(t(5));
+        w.push_id(t(6));
+        w.mark_rolled();
+        assert_eq!(w.resets(), 1);
+        // full record now = preamble + (the window, which became the post-reset stream content)
+        let full: Vec<i32> = w.full_ids().map(|tk| tk.0).collect();
+        assert_eq!(full, vec![1, 5, 6]);
+        assert!(w.tick_settle()); // settle was armed by the roll
+    }
+
+    // tick_settle reports whether we WERE suppressed, decrements, and saturates at zero.
+    #[test]
+    fn tick_settle_counts_down_and_saturates() {
+        let mut w = StreamWindow::default();
+        w.mark_rolled(); // arms settle = RESET_SETTLE
+        let mut suppressed_ticks = 0;
+        for _ in 0..(RESET_SETTLE + 5) {
+            if w.tick_settle() {
+                suppressed_ticks += 1;
+            }
+        }
+        assert_eq!(suppressed_ticks, RESET_SETTLE); // exactly RESET_SETTLE suppressed, then open
+        assert!(!w.tick_settle()); // saturated, stays open
+    }
+}
