@@ -17,6 +17,7 @@ mod lobe;
 mod present;
 mod present_scene;
 mod prompt;
+mod retrieval;
 mod sprite;
 mod stats;
 mod trace;
@@ -32,14 +33,6 @@ use lobe::{
     AskMode, EvictMode, InterjectMode, Lobe, LobeConfig, NoveltyMode, Signal, Source, Step, Trigger,
 };
 use stats::Welford;
-
-/// Retriever seam (#8). The real backends — file-memory for `mem` (this session's stored context),
-/// an external KB for `rag` — live in the harness; this stub returns None so the trigger → think →
-/// tool-call loop is observable end-to-end with zero external dependencies. A real backend replaces
-/// only this body, and the result would be fed back to the observer as a native `<|tool_response>`.
-fn run_retrieval(_source: Source, _query: &str) -> Option<String> {
-    None
-}
 
 /// A non-deterministic u64 seed from OS entropy, for `--random-seed`. Uses `RandomState` (seeded from
 /// the OS RNG for HashMap DoS-resistance) mixed with the wall-clock nanos — no `rand` dependency. The
@@ -250,6 +243,12 @@ enum Mode {
         #[arg(long, default_value_t = false)]
         rag: bool,
 
+        /// Corpus text file to retrieve over (#8): the "external knowledge base" a `search` tool call
+        /// is answered from (e.g. the novel being read). When set, retrieval is REAL (BM25 over the
+        /// file) and the model's hits feed back into a grounded aside; unset → retrieval finds nothing.
+        #[arg(long)]
+        rag_corpus: Option<String>,
+
         /// Use the FUSED concurrent forward pass (CONCURRENT_FORWARD_PASS): observation and
         /// interjection generation co-batch into one decode per stream token, so observation never
         /// stalls (the interjection forms in the background and emits ~N tokens after its trigger).
@@ -415,8 +414,28 @@ fn main() -> Result<()> {
             granularity,
             all_steps,
             rag,
+            rag_corpus,
             fused,
-        } => run_headless(&mut lobe, &cli, *granularity, *all_steps, *rag, *fused),
+        } => {
+            // Build the retrieval index once (BM25 over the corpus file) if --rag-corpus was given.
+            let corpus = match rag_corpus {
+                Some(path) => Some(retrieval::index(
+                    &std::fs::read_to_string(path)
+                        .with_context(|| format!("failed to read --rag-corpus {path}"))?,
+                    80, // ~80-word chunks: a readable passage, small enough to localize a hit
+                )),
+                None => None,
+            };
+            run_headless(
+                &mut lobe,
+                &cli,
+                *granularity,
+                *all_steps,
+                *rag,
+                *fused,
+                corpus.as_ref(),
+            )
+        }
         Mode::Tui {
             input,
             tick_ms,
@@ -534,6 +553,7 @@ fn process_observe_token(
     interject: bool,
     rag: bool,
     all_steps: bool,
+    corpus: Option<&retrieval::Corpus>,
     out: &mut impl Write,
 ) -> Result<bool> {
     let step = lobe.observe(tok, stats, cli.z, cli.topk)?;
@@ -548,7 +568,7 @@ fn process_observe_token(
             handle_interjection(lobe, stream_index, &surprising, cli.interject_max, out)?;
         }
         if rag {
-            handle_rag(lobe, stream_index, &surprising, out)?;
+            handle_rag(lobe, stream_index, &surprising, corpus, out)?;
         }
     }
 
@@ -593,9 +613,15 @@ fn handle_interjection(
 }
 
 /// #8 native tool-calling RAG pass for a fire: the free thought is emitted as an `interjection`, and
-/// a parsed tool call drives a `retrieval` event through the `run_retrieval` stub. Abstain → no
-/// retrieval, just the thought.
-fn handle_rag(lobe: &mut Lobe, stream_index: usize, surprising: &str, out: &mut impl Write) -> Result<()> {
+/// a parsed tool call drives a `retrieval` event answered by BM25 over the `--rag-corpus` (or nothing
+/// when no corpus was given). Abstain → no retrieval, just the thought.
+fn handle_rag(
+    lobe: &mut Lobe,
+    stream_index: usize,
+    surprising: &str,
+    corpus: Option<&retrieval::Corpus>,
+    out: &mut impl Write,
+) -> Result<()> {
     let rag_out = lobe.rag(surprising, 160)?;
     record_and_emit_interjection(lobe, stream_index, surprising, rag_out.thought.trim(), out)?;
     if let Some(d) = &rag_out.directive {
@@ -603,7 +629,7 @@ fn handle_rag(lobe: &mut Lobe, stream_index: usize, surprising: &str, out: &mut 
             Source::Mem => "mem",
             Source::Rag => "rag",
         };
-        let snippet = run_retrieval(d.source, &d.query);
+        let snippet = corpus.and_then(|c| retrieval::search(c, &d.query));
         let rev = serde_json::json!({
             "event": "retrieval", "stream_index": stream_index, "source": src,
             "query": d.query, "found": snippet.is_some(), "snippet": snippet,
@@ -616,6 +642,7 @@ fn handle_rag(lobe: &mut Lobe, stream_index: usize, surprising: &str, out: &mut 
 /// Each input chunk (line or word) is tokenized and each of its tokens is observed and
 /// scored individually, so a single noisy line can produce several events. Designed to
 /// be piped: `cat thinking_stream.txt | streaming-lobe --model m.gguf headless`.
+#[allow(clippy::too_many_arguments)]
 fn run_headless(
     lobe: &mut Lobe,
     cli: &Cli,
@@ -623,6 +650,7 @@ fn run_headless(
     all_steps: bool,
     rag: bool,
     fused: bool,
+    corpus: Option<&retrieval::Corpus>,
 ) -> Result<()> {
     let interject = cli.interject_on(); // global flag (on by default; --no-interject disables)
     let mut stats = Welford::new(cli.warmup, cli.adapt);
@@ -662,7 +690,8 @@ fn run_headless(
                     process_fused_token(lobe, tok, &mut stats, cli, signal_name, &mut out)?;
                 } else {
                     let fired = process_observe_token(
-                        lobe, tok, &mut stats, cli, signal_name, interject, rag, all_steps, &mut out,
+                        lobe, tok, &mut stats, cli, signal_name, interject, rag, all_steps, corpus,
+                        &mut out,
                     )?;
                     // Flush promptly on triggers so live consumers see them; plain steps stay buffered
                     // for throughput when piping --all-steps to a file.
