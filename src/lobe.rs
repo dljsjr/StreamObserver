@@ -24,7 +24,6 @@
 //! ---------------------------------------------------------------------------------
 
 use anyhow::Result;
-use clap::ValueEnum;
 use std::collections::VecDeque;
 
 /// How many of the most-recently-observed token texts to keep as rolling context for the
@@ -35,30 +34,6 @@ const RECENT_TOKENS: usize = 48;
 /// on sequence 0; generation runs entirely on this one and is discarded, so it never pollutes
 /// observation. Requires the context to be built with `n_seq_max >= 2`.
 const GEN_SEQ: i32 = 1;
-
-/// Which scalar the observer thresholds on to decide a token "fires" (punch-list #4, pluggable).
-/// Both are z-scored against the running Welford baseline, which tracks whichever signal is
-/// active — so `--z` means the same thing (sigmas above baseline) regardless of choice.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
-pub enum Signal {
-    /// -ln P(actual token): "that specific token was unexpected." The default.
-    Surprisal,
-    /// Entropy (nats) of the next-token distribution: "the model was uncertain *here*,"
-    /// independent of which token actually arrived. Catches confusion/forking points.
-    Entropy,
-}
-
-/// How the observer keeps streaming once sequence 0's KV cache fills (punch-list #6).
-#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
-pub enum EvictMode {
-    /// No eviction: decode until the context is full, then error. For bounded streams, or as the
-    /// large-`n_ctx` control arm in validation (isolates corpus drift from reset drift).
-    Off,
-    /// Cap + reset — the supported path on Gemma's iSWA cache. When the cache is near full, clear
-    /// sequence 0 and re-prime the pinned preamble + a rolling window of recent stream tokens, then
-    /// continue. No position-shift, so it never hits Gemma's iSWA context-shift limitation.
-    Reset,
-}
 
 /// Headroom (cells) kept below `n_ctx` so a reset fires *before* the cache is physically full. Also
 /// reserves slots for an in-flight interjection/RAG prefill, which shares the unified cache via
@@ -75,42 +50,10 @@ const MAX_SPAN_TOKENS: usize = 128;
 /// a HARD ceiling of `interject_max + this`, after which it stops regardless (rare runaway guard).
 const INTERJECT_SENTENCE_SLACK: usize = 64;
 
-/// Result of one fused `step()`: the observation plus whatever the concurrent interjection did.
-pub struct StepOutcome {
-    pub step: Step,
-    pub interjection: InterjectStatus,
-}
-
-/// What context an interjection reflects on.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
-pub enum InterjectMode {
-    /// Re-encode only the last `RECENT_TOKENS` stream tokens as a fresh prompt and react to the
-    /// surprising token. Narrow but self-contained; doesn't see the observer's real context.
-    Snippet,
-    /// Fork the observer's FULL live context (the seq-0 KV) onto the scratch sequence via
-    /// `copy_kv_cache_seq`, then ask it to reflect on that whole context. Cheaper (the context is
-    /// copied, not re-prefilled) and far richer. Cleanest with `--frame` (seq 0 is a real turn).
-    Context,
-}
-
-/// EXPERIMENT (templating study): how the context-mode ask FRAMES the request. `Passage` (control)
-/// hands the model a discrete quoted span to "comment on" — a self-contained micro-essay each fire,
-/// which may force a per-aside reset (H2). `Continuous` frames it as picking up an ongoing thread.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
-pub enum AskMode {
-    Passage,
-    Continuous,
-}
-
-/// EXPERIMENT (templating study): the novelty-memory framing (H4). `Fresh` (control) shows the last
-/// asides and asks for "a fresh angle" (content novelty). `Form` asks to vary rhythm/openings (form
-/// novelty). `Off` omits the novelty memory entirely (isolates whether showing prior asides matters).
-#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
-pub enum NoveltyMode {
-    Fresh,
-    Form,
-    Off,
-}
+// The public vocabulary (CLI enums + per-token result types) lives in its own module; re-exported
+// here so existing `crate::lobe::{Signal, Step, ...}` paths hold for `main` and the frontends.
+mod types;
+pub use types::{AskMode, EvictMode, InterjectMode, NoveltyMode, Signal, Step, StepOutcome, Trigger};
 
 // #8 RAG lives in its own module (the result types, the rag() pass, the tool-call parser). `pub mod`
 // so `rag()`'s public return type (`RagOutcome`) is reachable; `Source` is re-exported for `main`.
@@ -140,6 +83,11 @@ use firing::Firing;
 mod window;
 use window::StreamWindow;
 
+// Pure token-selection + text-shaping helpers (argmax, top-p sampling, RNG, span/sentence guards).
+// `pub(crate) use` re-export so the sibling modules keep reaching them via `super::` unchanged.
+mod sampling;
+pub(crate) use sampling::{argmax, ends_sentence, next_unit_f32, sample_topp, word_aligned};
+
 // Backend abstraction (docs/BACKEND.md): the observer talks only to these traits + types, never to
 // a concrete inference engine. `ActiveBackend` is the cfg-selected impl (llama today, candle later).
 use crate::backend::{ActiveBackend, Backend, Decode, Detok, Session, SessionConfig, Token};
@@ -147,37 +95,6 @@ use crate::backend::{ActiveBackend, Backend, Decode, Detok, Session, SessionConf
 // The loaded model + tokenizer now lives behind the backend abstraction: `ActiveBackend`
 // (= `backend::llama::LlamaBackend` or `backend::candle::CandleBackend`, per cargo feature).
 // Load it with `ActiveBackend::load(path, gpu_layers, verbose)`; it plays the old `Engine` role.
-
-/// A trigger emitted when the observer is surprised enough to "speak".
-#[derive(Debug, Clone)]
-pub struct Trigger {
-    /// Index of the token in the stream (0-based, counting only stream tokens).
-    pub stream_index: usize,
-    /// The surprising token, rendered to text.
-    pub token_text: String,
-    /// Raw surprisal in nats: -ln P(token).
-    pub surprisal: f32,
-    /// Entropy in nats of the distribution that predicted this token (model uncertainty here).
-    pub entropy: f32,
-    /// z-score of the ACTIVE signal against the running baseline (the value that actually fired).
-    pub z: f32,
-    /// What the model expected instead: top-k (text, probability), highest first.
-    pub expected: Vec<(String, f32)>,
-}
-
-/// One scored step of observation.
-#[derive(Debug, Clone)]
-pub struct Step {
-    pub stream_index: usize,
-    pub token_text: String,
-    pub surprisal: f32,
-    pub entropy: f32,
-    /// z-score of the ACTIVE signal (surprisal or entropy) against the running baseline.
-    pub z: f32,
-    pub fired: bool,
-    /// Only populated when `fired` (top-k is comparatively expensive, so we gate it).
-    pub trigger: Option<Trigger>,
-}
 
 pub struct Lobe<'a> {
     /// The backend (model + tokenizer), borrowed for tokenize/detok/is_eog/special-token lookups.
@@ -1022,92 +939,4 @@ impl<'a> Lobe<'a> {
             self.gen.in_flight,
         )
     }
-}
-
-
-/// Drop a leading partial-word fragment from a span of concatenated token pieces. Surprisal fires on
-/// subword tokens, so a span cut at a fire boundary can start mid-word: e.g. the trigger `ETY` (start
-/// of "ETYMOLOGY") ends one span, leaving the next span to begin with the orphan tail "MOLOGY". gemma
-/// renders word-start tokens with a leading space, so if the span's first char is NOT whitespace it
-/// began mid-word — skip to the first whitespace boundary so the model sees whole words, not stems.
-/// If there's no whitespace at all, return as-is (better a fragment than nothing).
-fn word_aligned(s: &str) -> &str {
-    match s.chars().next() {
-        Some(c) if !c.is_whitespace() => match s.find(char::is_whitespace) {
-            Some(i) => &s[i..],
-            None => s,
-        },
-        _ => s,
-    }
-}
-
-/// True if a partial generation ends at a natural sentence boundary, so a soft length cap can stop
-/// here instead of mid-clause. Tolerant of trailing markdown emphasis and closing quotes/brackets
-/// (e.g. `…the void.”` or `…*insists.*`).
-fn ends_sentence(s: &str) -> bool {
-    let t = s
-        .trim_end()
-        .trim_end_matches(|c: char| matches!(c, '"' | '\'' | '*' | '_' | '`' | ')' | ']' | '’' | '”' | '»'));
-    t.ends_with(|c: char| matches!(c, '.' | '!' | '?' | '…'))
-}
-
-
-/// Index of the maximum logit, as a token (greedy argmax).
-fn argmax(logits: &[f32]) -> Token {
-    let mut best = 0usize;
-    let mut best_v = f32::NEG_INFINITY;
-    for (i, &v) in logits.iter().enumerate() {
-        if v > best_v {
-            best_v = v;
-            best = i;
-        }
-    }
-    Token(best as i32)
-}
-
-/// Temperature + top-p (nucleus) sampling over a logit vector. `temp <= 0` falls back to greedy
-/// argmax. Used ONLY on the interjection generation path (the experiment: break greedy's verbatim
-/// collapse and surface latent varied observations); observation scoring stays exact. `rng` is an
-/// xorshift64 state advanced in place — seeded to a constant so a run is reproducible.
-fn sample_topp(logits: &[f32], temp: f32, top_p: f32, rng: &mut u64) -> Token {
-    if temp <= 0.0 {
-        return argmax(logits);
-    }
-    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut idx: Vec<usize> = (0..logits.len()).collect();
-    idx.sort_unstable_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
-    let inv_t = 1.0 / temp;
-    // Temperature-scaled softmax weights in descending-logit order.
-    let weights: Vec<f32> = idx.iter().map(|&i| ((logits[i] - max) * inv_t).exp()).collect();
-    let total: f32 = weights.iter().sum();
-    // Nucleus: smallest prefix whose cumulative prob ≥ top_p.
-    let mut cum = 0.0f32;
-    let mut cutoff = weights.len();
-    for (j, &w) in weights.iter().enumerate() {
-        cum += w / total;
-        if cum >= top_p {
-            cutoff = j + 1;
-            break;
-        }
-    }
-    let nucleus_sum: f32 = weights[..cutoff].iter().sum();
-    let r = next_unit_f32(rng) * nucleus_sum;
-    let mut acc = 0.0f32;
-    for j in 0..cutoff {
-        acc += weights[j];
-        if r <= acc {
-            return Token(idx[j] as i32);
-        }
-    }
-    Token(idx[cutoff - 1] as i32)
-}
-
-/// xorshift64* → uniform f32 in [0, 1). Advances `state` in place.
-fn next_unit_f32(state: &mut u64) -> f32 {
-    let mut x = *state;
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    *state = x;
-    ((x >> 40) as f32) / ((1u32 << 24) as f32)
 }
