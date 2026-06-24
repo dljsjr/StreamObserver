@@ -27,7 +27,7 @@ use ratatui::Frame;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use crate::lobe::{InterjectStatus, Lobe, Trigger};
+use crate::lobe::{Lobe, Trigger};
 use crate::stats::Welford;
 use crate::Cli;
 
@@ -147,39 +147,13 @@ pub fn run(lobe: &mut Lobe, cli: &Cli, input_path: &str, tick_ms: u64, skip_to: 
                     }
                     triggers.push_back(t);
                 }
-                // Render the fused interjection state. The dedup/reveal logic is identical to before;
-                // only its driver changed (step()'s InterjectStatus instead of interject_step()).
-                match status {
-                    Some(InterjectStatus::Started) => {
-                        pending = Some(String::new()); // buffering the opening → "💭 thinking…"
-                        revealed = false;
+                // The dedup/reveal policy lives in the lobe (shared by all live frontends); we just
+                // render `pending`/`revealed` and store whatever survives.
+                if let Some(text) = lobe.advance_reveal(status, &mut pending, &mut revealed)? {
+                    interjections.push(format!(">> {text}"));
+                    if interjections.len() > 50 {
+                        interjections.remove(0);
                     }
-                    Some(InterjectStatus::Working(partial)) => {
-                        if revealed {
-                            pending = Some(partial);
-                        } else if lobe.interjection_doomed(&partial) {
-                            lobe.abort_interjection()?; // dup — never render it
-                            pending = None;
-                        } else if lobe.interjection_decidable(&partial) {
-                            revealed = true; // novel — reveal + stream from here
-                            pending = Some(partial);
-                        } else {
-                            pending = Some(String::new());
-                        }
-                    }
-                    Some(InterjectStatus::Done(text)) => {
-                        let text = text.trim();
-                        if !text.is_empty() && (revealed || !lobe.interjection_doomed(text)) {
-                            lobe.record_interjection(text); // novelty memory (1b)
-                            interjections.push(format!(">> {text}"));
-                            if interjections.len() > 50 {
-                                interjections.remove(0);
-                            }
-                        }
-                        pending = None;
-                        revealed = false;
-                    }
-                    Some(InterjectStatus::Idle) | None => {}
                 }
             } else {
                 done = true;

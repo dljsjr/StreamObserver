@@ -16,7 +16,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 use std::time::{Duration, Instant};
 
-use crate::lobe::{InterjectStatus, Lobe};
+use crate::lobe::Lobe;
 use crate::stats::Welford;
 use crate::Cli;
 
@@ -104,37 +104,13 @@ pub fn run(lobe: &mut Lobe, cli: &Cli, input_path: &str, tick_ms: u64, skip_to: 
                     prose.drain(0..cut);
                 }
 
-                match status {
-                    Some(InterjectStatus::Started) => {
-                        pending = Some(String::new());
-                        revealed = false;
+                // The dedup/reveal policy lives in the lobe; we render `pending`/`revealed` and store
+                // whatever survives.
+                if let Some(text) = lobe.advance_reveal(status, &mut pending, &mut revealed)? {
+                    asides.push(text);
+                    if asides.len() > MAX_RECENT {
+                        asides.remove(0);
                     }
-                    Some(InterjectStatus::Working(partial)) => {
-                        if revealed {
-                            pending = Some(partial);
-                        } else if lobe.interjection_doomed(&partial) {
-                            lobe.abort_interjection()?; // a duplicate — never show it
-                            pending = None;
-                        } else if lobe.interjection_decidable(&partial) {
-                            revealed = true;
-                            pending = Some(partial);
-                        } else {
-                            pending = Some(String::new()); // buffering the opening → caret only
-                        }
-                    }
-                    Some(InterjectStatus::Done(text)) => {
-                        let text = text.trim();
-                        if !text.is_empty() && (revealed || !lobe.interjection_doomed(text)) {
-                            lobe.record_interjection(text); // novelty memory
-                            asides.push(text.to_string());
-                            if asides.len() > MAX_RECENT {
-                                asides.remove(0);
-                            }
-                        }
-                        pending = None;
-                        revealed = false;
-                    }
-                    Some(InterjectStatus::Idle) | None => {}
                 }
             } else {
                 done = true;

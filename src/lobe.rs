@@ -262,8 +262,8 @@ impl<'a> Lobe<'a> {
     }
 
     /// Is there enough of an in-flight interjection to decide novelty yet? See
-    /// `InterjectionMemory::decidable`.
-    pub fn interjection_decidable(&self, partial: &str) -> bool {
+    /// `InterjectionMemory::decidable`. (Private: only the shared `advance_reveal` machine needs it.)
+    fn interjection_decidable(&self, partial: &str) -> bool {
         self.memory.decidable(partial)
     }
 

@@ -133,6 +133,54 @@ impl Default for GenState {
 }
 
 impl Lobe<'_> {
+    /// Drive the streaming interjection-reveal state machine shared by the live frontends (tui /
+    /// present / present-scene), so the dedup/reveal POLICY lives here, not duplicated in every UI.
+    /// Given one tick's `InterjectStatus`, it buffers the opening as "thinking", aborts a doomed
+    /// duplicate before it ever renders, reveals a novel aside and streams it, and on completion
+    /// records the survivor as novelty memory. `pending` is the frontend's display buffer (None =
+    /// nothing; `Some("")` = a thinking caret; `Some(text)` = stream this) and `revealed` tracks
+    /// whether the in-flight aside has passed the dedup gate; the frontend renders them each frame.
+    /// Returns the final aside text once it completes AND survives dedup (so the frontend can store
+    /// it), else None. `None`/`Idle` status is a no-op (e.g. `--no-interject`).
+    pub fn advance_reveal(
+        &mut self,
+        status: Option<InterjectStatus>,
+        pending: &mut Option<String>,
+        revealed: &mut bool,
+    ) -> Result<Option<String>> {
+        match status {
+            Some(InterjectStatus::Started) => {
+                *pending = Some(String::new()); // buffering the opening → "thinking"
+                *revealed = false;
+            }
+            Some(InterjectStatus::Working(partial)) => {
+                if *revealed {
+                    *pending = Some(partial);
+                } else if self.interjection_doomed(&partial) {
+                    self.abort_interjection()?; // a duplicate — never render it
+                    *pending = None;
+                } else if self.interjection_decidable(&partial) {
+                    *revealed = true; // novel — reveal + stream from here
+                    *pending = Some(partial);
+                } else {
+                    *pending = Some(String::new());
+                }
+            }
+            Some(InterjectStatus::Done(text)) => {
+                let text = text.trim();
+                let survived = !text.is_empty() && (*revealed || !self.interjection_doomed(text));
+                *pending = None;
+                *revealed = false;
+                if survived {
+                    self.record_interjection(text); // novelty memory (1b)
+                    return Ok(Some(text.to_string()));
+                }
+            }
+            Some(InterjectStatus::Idle) | None => {}
+        }
+        Ok(None)
+    }
+
     /// Fork seq 0 onto GEN_SEQ and prefill the interjection ask in ONE decode (the single
     /// per-interjection stall), then seed the fused gen cursors. Subsequent reply tokens co-batch in
     /// `step()`. Mirrors `interject_begin` but drives the fused `gen_*` state instead of the

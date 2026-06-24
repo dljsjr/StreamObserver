@@ -17,7 +17,7 @@ use ratatui::Frame;
 use std::time::{Duration, Instant};
 use tachyonfx::{fx, Duration as FxDuration, Effect, EffectRenderer, ToRgbComponents};
 
-use crate::lobe::{InterjectStatus, Lobe};
+use crate::lobe::Lobe;
 use crate::sprite::{Anim, Sprite};
 use crate::stats::Welford;
 use crate::Cli;
@@ -154,34 +154,10 @@ pub fn run(lobe: &mut Lobe, cli: &Cli, input_path: &str, tick_ms: u64, skip_to: 
                     prose.drain(0..cut);
                 }
 
-                match status {
-                    Some(InterjectStatus::Started) => {
-                        pending = Some(String::new());
-                        revealed = false;
-                    }
-                    Some(InterjectStatus::Working(partial)) => {
-                        if revealed {
-                            pending = Some(partial);
-                        } else if lobe.interjection_doomed(&partial) {
-                            lobe.abort_interjection()?;
-                            pending = None;
-                        } else if lobe.interjection_decidable(&partial) {
-                            revealed = true;
-                            pending = Some(partial);
-                        } else {
-                            pending = Some(String::new());
-                        }
-                    }
-                    Some(InterjectStatus::Done(text)) => {
-                        let text = text.trim();
-                        if !text.is_empty() && (revealed || !lobe.interjection_doomed(text)) {
-                            lobe.record_interjection(text);
-                            last_aside = Some(text.to_string());
-                        }
-                        pending = None;
-                        revealed = false;
-                    }
-                    Some(InterjectStatus::Idle) | None => {}
+                // The dedup/reveal policy lives in the lobe; we render `pending`/`revealed` and store
+                // whatever survives.
+                if let Some(text) = lobe.advance_reveal(status, &mut pending, &mut revealed)? {
+                    last_aside = Some(text);
                 }
             } else {
                 done = true;
