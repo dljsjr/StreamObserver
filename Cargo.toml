@@ -1,8 +1,9 @@
 [package]
-name = "streaming-lobe"
+name = "stream-observer"
 version = "0.1.0"
 edition = "2021"
-description = "A small local model that observes a token stream and flags surprising tokens (a 'limbic' observer lobe)."
+license = "MIT"
+description = "A small local model that watches an LLM's token stream and reacts, concurrently, to what surprises it — a streaming surprisal observer (inspired by StreamingLLM)."
 
 [dependencies]
 # Thin, close-to-raw bindings that track upstream llama.cpp. The thinness is the point:

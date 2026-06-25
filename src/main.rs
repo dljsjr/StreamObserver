@@ -1,4 +1,4 @@
-//! streaming-lobe — a tiny local model that *observes* a token stream and flags the
+//! stream-observer — a tiny local model that *observes* a token stream and flags the
 //! tokens it finds surprising, optionally interjecting. Two frontends, one core:
 //!
 //!   headless : reads the stream from stdin, emits one JSON object per scored token on
@@ -48,12 +48,12 @@ fn entropy_seed() -> u64 {
 }
 
 #[derive(Parser, Clone)]
-#[command(name = "streaming-lobe", version, about)]
+#[command(name = "stream-observer", version, about)]
 struct Cli {
     /// Path to a GGUF model (e.g. a small Gemma/Qwen at Q4). The observer should be
     /// small and fast; this is the "limbic" lobe, not the cortex. Defaults to the gemma-4-E4B QAT
     /// 4-bit GGUF shipped in `models/` — the showcase model (the persona needs E4B; E2B collapses on
-    /// it) — so a bare `streaming-lobe --input … --skip-to …` runs the full demo. (E2B is also in
+    /// it) — so a bare `stream-observer --input … --skip-to …` runs the full demo. (E2B is also in
     /// `models/` for the leaner/headless use: `--model models/gemma-4-E2B_q4_0-it.gguf`.)
     #[arg(long, default_value = "models/gemma-4-E4B_q4_0-it.gguf")]
     model: String,
@@ -736,7 +736,7 @@ fn handle_rag(
 
 /// Each input chunk (line or word) is tokenized and each of its tokens is observed and
 /// scored individually, so a single noisy line can produce several events. Designed to
-/// be piped: `cat thinking_stream.txt | streaming-lobe --model m.gguf --mode headless`.
+/// be piped: `cat thinking_stream.txt | stream-observer --model m.gguf --mode headless`.
 #[allow(clippy::too_many_arguments)]
 fn run_headless(
     lobe: &mut Lobe,

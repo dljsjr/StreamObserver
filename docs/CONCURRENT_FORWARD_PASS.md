@@ -97,9 +97,9 @@ Frontends apply the same early-abort dedup as before (buffer → reveal-if-novel
 ```bash
 M=models/gemma-4-E2B_q4_0-it.gguf
 # works (snippet, no fork):
-cat in.txt | streaming-lobe --model $M --ctx 1024 --interject-mode snippet --mode headless --fused
+cat in.txt | stream-observer --model $M --ctx 1024 --interject-mode snippet --mode headless --fused
 # crashes under load (context fork):
-cat in.txt | streaming-lobe --model $M --ctx 1024 --interject-mode context --mode headless --fused
+cat in.txt | stream-observer --model $M --ctx 1024 --interject-mode context --mode headless --fused
 # observation float-parity check: diff trigger streams of `--no-interject` vs `--fused`.
 ```
 

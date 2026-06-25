@@ -101,7 +101,7 @@ a rebuild (it reads the JSON directly). But to see art changes in the LIVE TUI y
 ```bash
 cargo build --release --features metal
 # the showcase (voice + scene):
-./target/release/streaming-lobe --model models/gemma-4-E4B_q4_0-it.gguf \
+./target/release/stream-observer --model models/gemma-4-E4B_q4_0-it.gguf \
   --z 4.1 --refractory 320 --frame --interject-max 120 --dedup 0.5 --interject-temp 0.6 \
   --preamble-file personas/herzog_varyform.txt \
   present --scene --input corpus/pg2701.txt --skip-to "Call me Ishmael" --tick-ms 30
