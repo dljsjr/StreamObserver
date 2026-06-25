@@ -36,5 +36,10 @@ flamegraph.svg
 *.swp
 *~
 
+# My global gitignore has `CLAUDE*.md` as a safety net (so I don't accidentally dump agent
+# handoff files into other people's repos). For THIS repo I want it shipped — it's the candid
+# development log — so re-include it. A repo-local negation overrides the global excludes.
+!CLAUDE.md
+
 # Note: Cargo.lock is intentionally NOT ignored — this is a binary crate, so the
 # lockfile is committed for reproducible builds.
